@@ -1,5 +1,7 @@
 ## html, Vanilla JS • High Performance Particle Mapping
 
+![screenshot](1.avif)
+
 user drop image
 script internally scale it to 0.1MP
 script show circular hue HSL diagram with each image pixel placed in proper position. if >1 pixel of same color - place them near each other (without overlap) to visually represent area of same color.
