@@ -1,0 +1,3 @@
+add new 2D mode "2d pressure":
+	liquid must not flow over the surface. interpret the height of every cell as pressure of a gas and relax that pressure field instead, so a cell only ever pushes its direct neighbours. gas pressure representation gives a proper relaxation.
+	implement in js, and in webgl if js is too slow. hide webgl-only modes when the browser has no webgl.

@@ -499,6 +499,7 @@
 					<select id="engine-selector">
 						<option value="optimized">2D Swarm: O(1) Opaque Buffer</option>
 						<option value="naive">2D Swarm: O(N²) Naive Search</option>
+						<option value="pressure">2D Pressure: Gas Relaxation (WebGL)</option>
 						<option value="isometry">3D Isometric Skyscrapers</option>
 						<option value="lighttowers">3D: Count→Radius, Light→Height</option>
 						<option value="sand">3D: Skyscrapers → Sand Pyramids</option>
@@ -660,6 +661,64 @@
 		let liqMode = 'sand';    // engine selector value the running animation belongs to
 		let liqIslandCells = 0;  // number of cells inside the circular island (single-layer capacity)
 
+		// 2D Pressure (gas relaxation). Every pixel is one unit of gas sitting
+		// in its own hue/saturation cell, so a tower of N identical pixels is a
+		// cell holding N units: the skyscraper height IS the pressure in that
+		// cell. Nothing ever travels across the surface here — the surplus is
+		// handed to a neighbouring cell only, and that neighbour pushes its own
+		// neighbour, so dense colors inflate like a gas bubble and shove the
+		// pixels around them aside. The direction of every push comes from a
+		// real gas/incompressible pressure field p >= 0 solving
+		//     m + lap(p) <= 1,   p >= 0,   p * (m + lap(p) - 1) = 0
+		// (Neumann on the island rim, p = 0 wherever the gas is not compressed).
+		// That complementarity solve is run as projected red-black SOR on a
+		// 5-level coarse-to-fine pyramid: way too heavy for JS, so it lives on
+		// the GPU and the mode hides itself when WebGL2 float targets are gone.
+		const PR_BOUNDS = 240;            // grid half size, 1 cell = 1 screen pixel
+		const PR_DIM = 481;               // (240 * 2) + 1
+		const PR_CELLS = PR_DIM * PR_DIM; // 231361
+		const PR_RADIUS = 239;            // island radius: leaves a dead border ring
+		const PR_PLACE_R = 238;           // seeding radius, rounding stays on the island
+		const PR_MAX_PARTICLES = 120000;  // safe capacity for 100k resampled pixels
+		const PR_LEVELS = 5;              // 481 -> 241 -> 121 -> 61 -> 31
+		const PR_OMEGA = 1.9;             // over-relaxation factor of the SOR solve
+		const PR_SWEEPS = 60;             // red-black sweeps per pyramid level
+		const PR_MAX_ROUNDS = 10;         // solve/flow rounds before the greedy cleanup
+		const PR_CPU_SWEEP_BUDGET = 10;   // ms per frame when the CPU has to solve
+		const PR_GPU_RES_LIMIT = 25;      // residual above this = broken GPU result
+		let prMass = null;        // units of gas per cell (Int32)
+		let prIsland = null;      // 1 inside the circular island, doubles as level-0 capacity
+		let prDeg = null;         // island neighbour count per cell
+		let prPressure = null;    // relaxed pressure field (Float32)
+		let prPressureBits = null;// uint view of prPressure, used by the radix sort
+		let prTop = null;         // top particle of each cell stack, -1 = empty
+		let prBelow = null;       // particle under this one in the same cell
+		let prColor = null;       // exact ABGR color of every particle
+		let prPlanH = null;       // planned units crossing cell -> cell+1 (negative = other way)
+		let prPlanV = null;       // planned units crossing cell -> cell+PR_DIM
+		let prStageP = null;      // particles popped this frame (two-phase hop)
+		let prStageD = null;      // their destination cells
+		let prCellList = null;    // pressurised cells, sorted by pressure
+		let prSortTmp = null;     // radix sort scratch
+		let prRadix = null;       // radix sort histogram
+		let prLvlDim = null;      // pyramid level dimensions
+		let prLvlMass = null;     // coarse mass per level (level 0 = prMass)
+		let prLvlCap = null;      // coarse capacity per level (level 0 = prIsland)
+		let prLvlDeg = null;
+		let prLvlP = null;        // coarse pressure per level (level 0 = prPressure)
+		let prUpload = null;      // interleaved (mass, cap) scratch for GPU uploads
+		let prReadback = null;    // RGBA32F readback buffer
+		let prAllocated = false;
+		let prIslandCells = 0;
+		let prParticles = 0;
+		let prPhase = 0;          // 0 idle, 1 solve, 2 plan, 3 flow, 4 done
+		let prRound = 0;
+		let prAnimActive = false;
+		let prSimTime = 0;        // cumulative compute time for the stats panel
+		let prSolveLevel = 0;     // CPU chunked solve cursor
+		let prSolveSweep = 0;
+		let prRot = 0;            // rotating hop order, keeps the flow isotropic
+
 		// --- DOM ELEMENTS ---
 		const destCanvas = document.getElementById('hsl-canvas');
 		const destCtx = destCanvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -716,8 +775,19 @@
 		function init() {
 			initSpiral();
 			initLiquidIsland();
+			prHideIfUnsupported();
 			setupEventListeners();
 			loadPreset('wheel');
+		}
+
+		// The 2D Pressure solve only exists as a GPU kernel, so the mode is
+		// removed from the selector when WebGL2 float render targets are not
+		// available instead of offering a style that cannot run.
+		function prHideIfUnsupported() {
+			if (prWebglSupported()) return;
+			const opt = engineSelector.querySelector('option[value="pressure"]');
+			if (opt) opt.remove();
+			if (engineSelector.value === 'pressure') engineSelector.value = 'optimized';
 		}
 
 		// Pre-generate a compact square spiral offset sequence
@@ -1692,6 +1762,16 @@
 				liqSimTime = performance.now() - startTime;
 				startLiquidAnimation();
 
+			} else if (vizStyle === 'pressure') {
+				// --- 2D PRESSURE: GAS RELAXATION ---
+				// Stage 1 places every pixel as one unit of gas in its exact
+				// hue/saturation cell, so cells that collect many identical
+				// pixels start out hugely compressed (that stack height is the
+				// pressure). Stage 2 relaxes that pressure field and lets the
+				// surplus push its way out one cell at a time.
+				placedCount = prSeed(srcData, pixelCount);
+				prBeginRound(startTime);
+
 			} else {
 				// --- 2D SWARM (O(1) OPTIMIZED OR O(N^2) NAIVE) ---
 				const cx2D = 300;
@@ -2097,6 +2177,874 @@
 			// loop retire instead of reseeding them endlessly.
 			if (liqQueueCount > 0 || moved > 0) requestAnimationFrame(liqAnimationTick);
 			else liqAnimActive = false;
+		}
+
+		// --- 2D PRESSURE MODE: GAS RELAXATION (WEBGL SOLVE + CPU TRANSPORT) ---
+		// Pipeline per round:
+		//   solve  - projected red-black SOR for the pressure complementarity
+		//            problem, coarse-to-fine over the 5 level pyramid (GPU).
+		//   plan   - walk the cells from the highest pressure down and book an
+		//            exact integer number of units for every cell edge that
+		//            points downhill. Because a cell is only handled after all
+		//            of its suppliers, the surplus it has to hand on is known
+		//            exactly: the plan is conservative, acyclic and finite.
+		//   flow   - animate the plan, every particle hopping at most one cell
+		//            per frame, so the gas visibly inflates and the pixels in
+		//            front of it are pushed away cell by cell.
+		// Rounds repeat until no cell holds more than one pixel: the result is
+		// a gap-free 2D mosaic grown purely by pressure.
+
+		// One-time allocation; the mode is memory hungry, so nothing is
+		// reserved until it is actually selected.
+		function prAlloc() {
+			if (prAllocated) return;
+			prAllocated = true;
+			prMass = new Int32Array(PR_CELLS);
+			prIsland = new Uint8Array(PR_CELLS);
+			prDeg = new Uint8Array(PR_CELLS);
+			prPressure = new Float32Array(PR_CELLS);
+			prPressureBits = new Uint32Array(prPressure.buffer);
+			prTop = new Int32Array(PR_CELLS);
+			prBelow = new Int32Array(PR_MAX_PARTICLES);
+			prColor = new Uint32Array(PR_MAX_PARTICLES);
+			prPlanH = new Int32Array(PR_CELLS);
+			prPlanV = new Int32Array(PR_CELLS);
+			prStageP = new Int32Array(PR_MAX_PARTICLES);
+			prStageD = new Int32Array(PR_MAX_PARTICLES);
+			prCellList = new Int32Array(PR_CELLS);
+			prSortTmp = new Int32Array(PR_CELLS);
+			prRadix = new Uint32Array(2048);
+			prUpload = new Float32Array(PR_CELLS * 2);
+
+			// Circular island: only cells inside r <= PR_RADIUS can hold gas.
+			// The radius leaves the outermost ring of every pyramid level
+			// empty, so neighbour lookups never run off a row.
+			prIslandCells = 0;
+			for (let gv = -PR_BOUNDS; gv <= PR_BOUNDS; gv++) {
+				const row = (gv + PR_BOUNDS) * PR_DIM + PR_BOUNDS;
+				for (let gu = -PR_BOUNDS; gu <= PR_BOUNDS; gu++) {
+					const inside = gu * gu + gv * gv <= PR_RADIUS * PR_RADIUS ? 1 : 0;
+					prIsland[row + gu] = inside;
+					prIslandCells += inside;
+				}
+			}
+
+			// Pyramid: level 0 reuses the live arrays, coarse levels are tiny.
+			prLvlDim = new Int32Array(PR_LEVELS);
+			prLvlMass = new Array(PR_LEVELS);
+			prLvlCap = new Array(PR_LEVELS);
+			prLvlDeg = new Array(PR_LEVELS);
+			prLvlP = new Array(PR_LEVELS);
+			let dim = PR_DIM;
+			for (let k = 0; k < PR_LEVELS; k++) {
+				prLvlDim[k] = dim;
+				if (k === 0) {
+					prLvlMass[k] = prMass;
+					prLvlCap[k] = prIsland;
+					prLvlDeg[k] = prDeg;
+					prLvlP[k] = prPressure;
+				} else {
+					prLvlMass[k] = new Float32Array(dim * dim);
+					prLvlCap[k] = new Float32Array(dim * dim);
+					prLvlDeg[k] = new Uint8Array(dim * dim);
+					prLvlP[k] = new Float32Array(dim * dim);
+				}
+				dim = (dim + 1) >> 1;
+			}
+
+			// Capacity of a coarse cell = number of island cells it covers, so
+			// the coarse equation keeps the same form: deg*p - sum(p) = m - cap.
+			for (let k = 1; k < PR_LEVELS; k++) {
+				const fd = prLvlDim[k - 1];
+				const cd = prLvlDim[k];
+				const fc = prLvlCap[k - 1];
+				const cc = prLvlCap[k];
+				cc.fill(0);
+				for (let y = 0; y < fd; y++) {
+					const cy = (y >> 1) * cd;
+					const fy = y * fd;
+					for (let x = 0; x < fd; x++) cc[cy + (x >> 1)] += fc[fy + x];
+				}
+			}
+			for (let k = 0; k < PR_LEVELS; k++) {
+				const d = prLvlDim[k];
+				const cap = prLvlCap[k];
+				const dg = prLvlDeg[k];
+				for (let y = 0; y < d; y++) {
+					for (let x = 0; x < d; x++) {
+						const i = y * d + x;
+						if (cap[i] === 0) { dg[i] = 0; continue; }
+						let n = 0;
+						if (x > 0 && cap[i - 1] > 0) n++;
+						if (x < d - 1 && cap[i + 1] > 0) n++;
+						if (y > 0 && cap[i - d] > 0) n++;
+						if (y < d - 1 && cap[i + d] > 0) n++;
+						dg[i] = n;
+					}
+				}
+			}
+		}
+
+		// Stage 1: hue -> angle, saturation -> radius, one gas unit per pixel.
+		// Identical pixels pile into the same cell exactly like the skyscraper
+		// towers do; here that stack is read as the pressure of the cell.
+		function prSeed(srcData, pixelCount) {
+			prAlloc();
+			prMass.fill(0);
+			prPressure.fill(0);
+			prTop.fill(-1);
+			prPlanH.fill(0);
+			prPlanV.fill(0);
+			prParticles = 0;
+			prRot = 0;
+
+			const budget = prIslandCells < PR_MAX_PARTICLES ? prIslandCells : PR_MAX_PARTICLES;
+			for (let i = 0; i < pixelCount; i++) {
+				const srcIdx = i * 4;
+				if (srcData[srcIdx + 3] < 10) continue;
+
+				const r = srcData[srcIdx];
+				const g = srcData[srcIdx + 1];
+				const b = srcData[srcIdx + 2];
+
+				const rf = r / 255;
+				const gf = g / 255;
+				const bf = b / 255;
+				const max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+				const min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+
+				let h = 0;
+				let s = 0;
+				const l = (max + min) * 0.5;
+
+				if (max !== min) {
+					const d = max - min;
+					s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+					if (max === rf) {
+						h = (gf - bf) / d + (gf < bf ? 6 : 0);
+					} else if (max === gf) {
+						h = (bf - rf) / d + 2;
+					} else {
+						h = (rf - gf) / d + 4;
+					}
+					h /= 6;
+				}
+
+				const theta = h * 2 * Math.PI;
+				const rDist = s * PR_PLACE_R;
+				let gu = Math.round(rDist * Math.cos(theta));
+				let gv = Math.round(rDist * Math.sin(theta));
+				if (gu < -PR_BOUNDS) gu = -PR_BOUNDS; else if (gu > PR_BOUNDS) gu = PR_BOUNDS;
+				if (gv < -PR_BOUNDS) gv = -PR_BOUNDS; else if (gv > PR_BOUNDS) gv = PR_BOUNDS;
+				const cell = (gv + PR_BOUNDS) * PR_DIM + (gu + PR_BOUNDS);
+				if (prIsland[cell] === 0) continue; // numerically impossible, kept as a guard
+
+				if (prParticles >= budget) break;
+				const p = prParticles++;
+				prColor[p] = 0xFF000000 | (b << 16) | (g << 8) | r;
+				prBelow[p] = prTop[cell];
+				prTop[cell] = p;
+				prMass[cell]++;
+			}
+			return prParticles;
+		}
+
+		// --- PRESSURE SOLVE -------------------------------------------------
+		// Restrict the live mass field onto the coarse levels (summing units
+		// keeps total gas and capacity consistent at every scale).
+		function prRestrictMass() {
+			for (let k = 1; k < PR_LEVELS; k++) {
+				const fd = prLvlDim[k - 1];
+				const cd = prLvlDim[k];
+				const fm = prLvlMass[k - 1];
+				const cm = prLvlMass[k];
+				cm.fill(0);
+				for (let y = 0; y < fd; y++) {
+					const cy = (y >> 1) * cd;
+					const fy = y * fd;
+					for (let x = 0; x < fd; x++) {
+						const m = fm[fy + x];
+						if (m !== 0) cm[cy + (x >> 1)] += m;
+					}
+				}
+			}
+		}
+
+		// Projected red-black SOR: identical ordering to the GPU kernel so the
+		// CPU fallback and the shader converge the same way.
+		function prSweepLevel(k, sweeps) {
+			const dim = prLvlDim[k];
+			const mass = prLvlMass[k];
+			const cap = prLvlCap[k];
+			const deg = prLvlDeg[k];
+			const p = prLvlP[k];
+			for (let s = 0; s < sweeps; s++) {
+				for (let parity = 0; parity < 2; parity++) {
+					for (let y = 0; y < dim; y++) {
+						const row = y * dim;
+						for (let x = (y + parity) & 1; x < dim; x += 2) {
+							const i = row + x;
+							const d = deg[i];
+							if (d === 0) continue;
+							let sum = 0;
+							if (cap[i - 1] > 0) sum += p[i - 1];
+							if (cap[i + 1] > 0) sum += p[i + 1];
+							if (cap[i - dim] > 0) sum += p[i - dim];
+							if (cap[i + dim] > 0) sum += p[i + dim];
+							let v = (sum + mass[i] - cap[i]) / d;
+							v = p[i] + PR_OMEGA * (v - p[i]);
+							p[i] = v > 0 ? v : 0;
+						}
+					}
+				}
+			}
+		}
+
+		// Piecewise-constant prolongation: the coarse solution is only used as
+		// a starting guess, the finer level does the detail work.
+		function prProlongate(k) {
+			const cd = prLvlDim[k];
+			const fd = prLvlDim[k - 1];
+			const cp = prLvlP[k];
+			const fp = prLvlP[k - 1];
+			const fdeg = prLvlDeg[k - 1];
+			for (let y = 0; y < fd; y++) {
+				const cy = (y >> 1) * cd;
+				const fy = y * fd;
+				for (let x = 0; x < fd; x++) {
+					const i = fy + x;
+					fp[i] = fdeg[i] === 0 ? 0 : cp[cy + (x >> 1)];
+				}
+			}
+		}
+
+		// Worst violation of the complementarity system on the fine grid; used
+		// to verify that the GPU actually produced a usable field.
+		function prResidual() {
+			let worst = 0;
+			for (let i = 0; i < PR_CELLS; i++) {
+				const d = prDeg[i];
+				if (d === 0) continue;
+				let sum = 0;
+				if (prIsland[i - 1] > 0) sum += prPressure[i - 1];
+				if (prIsland[i + 1] > 0) sum += prPressure[i + 1];
+				if (prIsland[i - PR_DIM] > 0) sum += prPressure[i - PR_DIM];
+				if (prIsland[i + PR_DIM] > 0) sum += prPressure[i + PR_DIM];
+				const r = sum + prMass[i] - prIsland[i] - d * prPressure[i];
+				if (prPressure[i] === 0 && r < 0) continue; // inactive constraint
+				const a = r < 0 ? -r : r;
+				if (a > worst) worst = a;
+			}
+			return worst;
+		}
+
+		// --- TRANSPORT PLAN -------------------------------------------------
+		// Radix sort the pressurised cells by pressure. All values are >= 0, so
+		// their float bit patterns sort exactly like the numbers do.
+		function prSortCellsByPressure(count) {
+			let src = prCellList;
+			let dst = prSortTmp;
+			for (let shift = 0; shift < 32; shift += 11) {
+				const bits = shift === 22 ? 10 : 11;
+				const buckets = 1 << bits;
+				const mask = buckets - 1;
+				prRadix.fill(0, 0, buckets);
+				for (let i = 0; i < count; i++) prRadix[(prPressureBits[src[i]] >>> shift) & mask]++;
+				let sum = 0;
+				for (let b = 0; b < buckets; b++) {
+					const c = prRadix[b];
+					prRadix[b] = sum;
+					sum += c;
+				}
+				for (let i = 0; i < count; i++) {
+					const cell = src[i];
+					dst[prRadix[(prPressureBits[cell] >>> shift) & mask]++] = cell;
+				}
+				const t = src; src = dst; dst = t;
+			}
+			if (src !== prCellList) prCellList.set(src.subarray(0, count));
+			for (let i = 0, j = count - 1; i < j; i++, j--) {
+				const t = prCellList[i];
+				prCellList[i] = prCellList[j];
+				prCellList[j] = t;
+			}
+		}
+
+		// Book every unit that has to leave a cell onto one of its downhill
+		// edges. Highest pressure first, so all inbound units are already
+		// known and the surplus splits without any rounding drift.
+		function prBuildPlan() {
+			let count = 0;
+			for (let c = 0; c < PR_CELLS; c++) {
+				if (prPressure[c] > 0) prCellList[count++] = c;
+			}
+			if (count === 0) return 0;
+			prSortCellsByPressure(count);
+
+			let planned = 0;
+			for (let i = 0; i < count; i++) {
+				const c = prCellList[i];
+				const pc = prPressure[c];
+				let income = 0;
+				const hl = prPlanH[c - 1];
+				const hr = prPlanH[c];
+				const vu = prPlanV[c - PR_DIM];
+				const vd = prPlanV[c];
+				if (hl > 0) income += hl;
+				if (hr < 0) income -= hr;
+				if (vu > 0) income += vu;
+				if (vd < 0) income -= vd;
+
+				let supply = prMass[c] + income - 1;
+				if (supply <= 0) continue;
+
+				let w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+				if (prIsland[c - 1] > 0) { const f = pc - prPressure[c - 1]; if (f > 0) w0 = f; }
+				if (prIsland[c + 1] > 0) { const f = pc - prPressure[c + 1]; if (f > 0) w1 = f; }
+				if (prIsland[c - PR_DIM] > 0) { const f = pc - prPressure[c - PR_DIM]; if (f > 0) w2 = f; }
+				if (prIsland[c + PR_DIM] > 0) { const f = pc - prPressure[c + PR_DIM]; if (f > 0) w3 = f; }
+				const wsum = w0 + w1 + w2 + w3;
+				if (wsum <= 0) continue;
+
+				// Largest-remainder split of an integer surplus over the open
+				// channels: exact, so nothing is created or lost.
+				const scale = supply / wsum;
+				const f0 = w0 * scale, f1 = w1 * scale, f2 = w2 * scale, f3 = w3 * scale;
+				let n0 = f0 | 0, n1 = f1 | 0, n2 = f2 | 0, n3 = f3 | 0;
+				let rest = supply - n0 - n1 - n2 - n3;
+				while (rest > 0) {
+					let best = -1;
+					let bestR = -1;
+					const r0 = f0 - n0, r1 = f1 - n1, r2 = f2 - n2, r3 = f3 - n3;
+					if (w0 > 0 && r0 > bestR) { bestR = r0; best = 0; }
+					if (w1 > 0 && r1 > bestR) { bestR = r1; best = 1; }
+					if (w2 > 0 && r2 > bestR) { bestR = r2; best = 2; }
+					if (w3 > 0 && r3 > bestR) { bestR = r3; best = 3; }
+					if (best === 0) n0++; else if (best === 1) n1++; else if (best === 2) n2++; else n3++;
+					rest--;
+				}
+				if (n0 !== 0) prPlanH[c - 1] -= n0;
+				if (n1 !== 0) prPlanH[c] += n1;
+				if (n2 !== 0) prPlanV[c - PR_DIM] -= n2;
+				if (n3 !== 0) prPlanV[c] += n3;
+				planned += supply;
+			}
+			return planned;
+		}
+
+		// --- FLOW -----------------------------------------------------------
+		// One animation frame of the plan. Pops are staged first, so a unit
+		// that lands in a cell cannot be forwarded again in the same frame:
+		// every pixel moves exactly one cell, never sliding over the surface.
+		function prFlowStep() {
+			let staged = 0;
+			prRot = (prRot + 1) & 3;
+			for (let c = 0; c < PR_CELLS; c++) {
+				let avail = prMass[c];
+				if (avail === 0) continue;
+				const hl = prPlanH[c - 1];
+				const hr = prPlanH[c];
+				const vu = prPlanV[c - PR_DIM];
+				const vd = prPlanV[c];
+				const o0 = hl < 0 ? -hl : 0;
+				const o1 = hr > 0 ? hr : 0;
+				const o2 = vu < 0 ? -vu : 0;
+				const o3 = vd > 0 ? vd : 0;
+				if ((o0 | o1 | o2 | o3) === 0) continue;
+
+				for (let k = 0; k < 4 && avail > 0; k++) {
+					const dir = (prRot + k) & 3;
+					let n;
+					let dest;
+					if (dir === 0) { n = o0; dest = c - 1; }
+					else if (dir === 1) { n = o1; dest = c + 1; }
+					else if (dir === 2) { n = o2; dest = c - PR_DIM; }
+					else { n = o3; dest = c + PR_DIM; }
+					if (n === 0) continue;
+					if (n > avail) n = avail;
+					for (let q = 0; q < n; q++) {
+						const p = prTop[c];
+						prTop[c] = prBelow[p];
+						prStageP[staged] = p;
+						prStageD[staged] = dest;
+						staged++;
+					}
+					prMass[c] -= n;
+					avail -= n;
+					if (dir === 0) prPlanH[c - 1] += n;
+					else if (dir === 1) prPlanH[c] -= n;
+					else if (dir === 2) prPlanV[c - PR_DIM] += n;
+					else prPlanV[c] -= n;
+				}
+			}
+			for (let i = 0; i < staged; i++) {
+				const p = prStageP[i];
+				const d = prStageD[i];
+				prBelow[p] = prTop[d];
+				prTop[d] = p;
+				prMass[d]++;
+			}
+			return staged;
+		}
+
+		function prOverload() {
+			let over = 0;
+			for (let c = 0; c < PR_CELLS; c++) {
+				const m = prMass[c];
+				if (m > 1) over += m - 1;
+			}
+			return over;
+		}
+
+		// Last resort for the handful of units a nearly converged solve can
+		// leave behind: drop them into the closest free island cell using the
+		// shared spiral offsets. Keeps the mosaic strictly one pixel per cell.
+		function prGreedyCleanup() {
+			for (let c = 0; c < PR_CELLS; c++) {
+				while (prMass[c] > 1) {
+					const gu = (c % PR_DIM) - PR_BOUNDS;
+					const gv = ((c / PR_DIM) | 0) - PR_BOUNDS;
+					let placed = false;
+					for (let k = 1; k < MAX_SPIRAL_OFFSETS; k++) {
+						const tu = gu + spiralX[k];
+						const tv = gv + spiralY[k];
+						if (tu < -PR_BOUNDS || tu > PR_BOUNDS || tv < -PR_BOUNDS || tv > PR_BOUNDS) continue;
+						const t = (tv + PR_BOUNDS) * PR_DIM + (tu + PR_BOUNDS);
+						if (prIsland[t] === 0 || prMass[t] !== 0) continue;
+						const p = prTop[c];
+						prTop[c] = prBelow[p];
+						prMass[c]--;
+						prBelow[p] = -1;
+						prTop[t] = p;
+						prMass[t] = 1;
+						placed = true;
+						break;
+					}
+					if (!placed) break; // island is full, nothing else can be done
+				}
+			}
+		}
+
+		// --- RENDER ---------------------------------------------------------
+		// Flat top-down view on the same disc the 2D swarm uses. Compressed
+		// cells glow white: that glow is the pressure still waiting to escape,
+		// and it fades away as the gas finds room.
+		function prDraw() {
+			grid.fill(0);
+			for (let gv = -PR_BOUNDS; gv <= PR_BOUNDS; gv++) {
+				const row = (gv + PR_BOUNDS) * PR_DIM + PR_BOUNDS;
+				const py = 300 + gv;
+				if (py < 0 || py >= H) continue;
+				const rowOut = py * W + 300;
+				for (let gu = -PR_BOUNDS; gu <= PR_BOUNDS; gu++) {
+					const cell = row + gu;
+					const p = prTop[cell];
+					if (p === -1) continue;
+					const color = prColor[p];
+					const over = prMass[cell] - 1;
+					if (over === 0) {
+						grid[rowOut + gu] = color;
+					} else {
+						// blend towards white, strength follows the compression
+						const t = (over / (over + 16)) * 0.85;
+						const r = color & 255;
+						const g = (color >>> 8) & 255;
+						const b = (color >>> 16) & 255;
+						const nr = r + (255 - r) * t;
+						const ng = g + (255 - g) * t;
+						const nb = b + (255 - b) * t;
+						grid[rowOut + gu] = 0xFF000000 | (nb << 16) | (ng << 8) | nr;
+					}
+				}
+			}
+			offscreenPlacementCtx.putImageData(destImgData, 0, 0);
+			drawBackgroundGuide(destCtx, W, H, 300, 300, 240);
+			destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+		}
+
+		// --- DRIVER ---------------------------------------------------------
+		// Arm a fresh pressure solve: restrict the current masses up the
+		// pyramid and discard the previous field.
+		function prBeginSolve() {
+			prPhase = 1;
+			prSolveLevel = PR_LEVELS - 1;
+			prSolveSweep = 0;
+			prRestrictMass();
+			for (let k = 0; k < PR_LEVELS; k++) prLvlP[k].fill(0);
+		}
+
+		function prBeginRound(startTime) {
+			prRound = 0;
+			prBeginSolve();
+			prDraw();
+			prSimTime = performance.now() - startTime;
+			statsTime.textContent = prSimTime.toFixed(1) + ' ms';
+			if (!prAnimActive) {
+				prAnimActive = true;
+				requestAnimationFrame(prTick);
+			}
+		}
+
+		// One animation frame of the gas. A tick is stateless with respect to
+		// the run it was scheduled for, so a re-render that happens while a
+		// tick is pending simply gets picked up by that pending tick.
+		function prTick() {
+			if (engineSelector.value !== 'pressure' || prPhase === 0 || prPhase === 4) {
+				prAnimActive = false;
+				return;
+			}
+
+			const t0 = performance.now();
+			if (prPhase === 1) {
+				// Solve the pressure field. The GPU finishes a whole pyramid in
+				// one frame; the CPU fallback is chunked to stay responsive.
+				const done = prGpuAvailable() ? prSolveGpu() : prSolveCpuChunk();
+				if (done) {
+					prPhase = 2;
+					prDraw();
+				}
+			} else if (prPhase === 2) {
+				const planned = prBuildPlan();
+				prRound++;
+				if (planned === 0 || prRound > PR_MAX_ROUNDS) {
+					if (prOverload() > 0) prGreedyCleanup();
+					prPhase = 4;
+				} else {
+					prPhase = 3;
+				}
+				prDraw();
+			} else if (prPhase === 3) {
+				const moved = prFlowStep();
+				if (moved === 0) {
+					if (prOverload() === 0) {
+						prPhase = 4;
+					} else {
+						prBeginSolve();
+					}
+				}
+				prDraw();
+			}
+
+			prSimTime += performance.now() - t0;
+			statsTime.textContent = prSimTime.toFixed(1) + ' ms';
+			if (prPhase === 4) {
+				prAnimActive = false;
+				return;
+			}
+			requestAnimationFrame(prTick);
+		}
+
+		// Sweeps spent on a level. The finest grid carries the detail, so it
+		// gets a double budget: coarse levels only provide the global guess.
+		function prLevelSweeps(k) {
+			return k === 0 ? PR_SWEEPS * 2 : PR_SWEEPS;
+		}
+
+		// Chunked CPU solve: only used when the GPU kernel is unavailable or
+		// returned nonsense. Same red-black SOR, spread over frames.
+		function prSolveCpuChunk() {
+			const deadline = performance.now() + PR_CPU_SWEEP_BUDGET;
+			do {
+				const total = prLevelSweeps(prSolveLevel);
+				const batch = prSolveLevel === 0 ? 4 : 20;
+				const left = total - prSolveSweep;
+				const n = batch < left ? batch : left;
+				prSweepLevel(prSolveLevel, n);
+				prSolveSweep += n;
+				if (prSolveSweep >= total) {
+					if (prSolveLevel === 0) return true;
+					prProlongate(prSolveLevel);
+					prSolveLevel--;
+					prSolveSweep = 0;
+				}
+			} while (performance.now() < deadline);
+			return false;
+		}
+
+		// --- WEBGL PRESSURE KERNEL ------------------------------------------
+		// The solve is ~700 red-black SOR passes over a 481x481 grid plus its
+		// coarse levels every round. That is seconds of JS, milliseconds of
+		// GPU, so it runs as a fragment shader ping-pong over float textures.
+		// Everything degrades safely: no WebGL2 -> the mode is not offered,
+		// a broken context mid-flight -> the CPU finishes the job.
+		const PR_VS = `#version 300 es
+void main() {
+	vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+	gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+		// One projected red-black SOR half sweep.
+		// uSrc.x = units of gas in the cell, uSrc.y = its capacity.
+		const PR_FS_SOLVE = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D uP;
+uniform sampler2D uSrc;
+uniform float uOmega;
+uniform int uParity;
+uniform int uDim;
+out vec4 oColor;
+void main() {
+	ivec2 c = ivec2(gl_FragCoord.xy);
+	vec2 s = texelFetch(uSrc, c, 0).xy;
+	float pOld = texelFetch(uP, c, 0).x;
+	if (s.y <= 0.0) { oColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+	if (((c.x + c.y) & 1) != uParity) { oColor = vec4(pOld, 0.0, 0.0, 1.0); return; }
+	float sum = 0.0;
+	float deg = 0.0;
+	ivec2 n;
+	if (c.x > 0) { n = ivec2(c.x - 1, c.y); if (texelFetch(uSrc, n, 0).y > 0.0) { sum += texelFetch(uP, n, 0).x; deg += 1.0; } }
+	if (c.x < uDim - 1) { n = ivec2(c.x + 1, c.y); if (texelFetch(uSrc, n, 0).y > 0.0) { sum += texelFetch(uP, n, 0).x; deg += 1.0; } }
+	if (c.y > 0) { n = ivec2(c.x, c.y - 1); if (texelFetch(uSrc, n, 0).y > 0.0) { sum += texelFetch(uP, n, 0).x; deg += 1.0; } }
+	if (c.y < uDim - 1) { n = ivec2(c.x, c.y + 1); if (texelFetch(uSrc, n, 0).y > 0.0) { sum += texelFetch(uP, n, 0).x; deg += 1.0; } }
+	if (deg == 0.0) { oColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+	float v = (sum + s.x - s.y) / deg;
+	v = pOld + uOmega * (v - pOld);
+	oColor = vec4(max(v, 0.0), 0.0, 0.0, 1.0);
+}`;
+
+		// uDiv = 2 lifts a coarse solution onto the next finer level,
+		// uDiv = 1 copies the final field into the readback target.
+		const PR_FS_COPY = `#version 300 es
+precision highp float;
+precision highp sampler2D;
+uniform sampler2D uP;
+uniform sampler2D uSrc;
+uniform int uDiv;
+out vec4 oColor;
+void main() {
+	ivec2 c = ivec2(gl_FragCoord.xy);
+	if (texelFetch(uSrc, c, 0).y <= 0.0) { oColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+	ivec2 s = uDiv == 2 ? c / 2 : c;
+	oColor = vec4(texelFetch(uP, s, 0).x, 0.0, 0.0, 1.0);
+}`;
+
+		let prGlChecked = false;
+		let prGlOk = false;
+		let prGlInited = false;
+		let prGlBroken = false;
+		let prGl = null;
+		let prGlCanvas = null;
+		let prGlSolve = null;
+		let prGlCopy = null;
+		let prGlFbo = null;
+		let prGlSrcTex = null;
+		let prGlPTex = null;
+		let prGlReadTex = null;
+		let prGlCur = null;
+
+		// Cheap capability probe, run once before the selector is built.
+		function prWebglSupported() {
+			if (prGlChecked) return prGlOk;
+			prGlChecked = true;
+			try {
+				const probe = document.createElement('canvas');
+				probe.width = 1;
+				probe.height = 1;
+				const gl = probe.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false });
+				if (gl && gl.getExtension('EXT_color_buffer_float')) prGlOk = true;
+				if (gl) {
+					const lose = gl.getExtension('WEBGL_lose_context');
+					if (lose) lose.loseContext();
+				}
+			} catch (e) {
+				prGlOk = false;
+			}
+			return prGlOk;
+		}
+
+		function prGlCompile(gl, type, source) {
+			const sh = gl.createShader(type);
+			gl.shaderSource(sh, source);
+			gl.compileShader(sh);
+			if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+				gl.deleteShader(sh);
+				return null;
+			}
+			return sh;
+		}
+
+		function prGlLink(gl, fsSource) {
+			const vs = prGlCompile(gl, gl.VERTEX_SHADER, PR_VS);
+			const fs = prGlCompile(gl, gl.FRAGMENT_SHADER, fsSource);
+			if (!vs || !fs) return null;
+			const prog = gl.createProgram();
+			gl.attachShader(prog, vs);
+			gl.attachShader(prog, fs);
+			gl.linkProgram(prog);
+			gl.deleteShader(vs);
+			gl.deleteShader(fs);
+			if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+				gl.deleteProgram(prog);
+				return null;
+			}
+			return {
+				prog,
+				uP: gl.getUniformLocation(prog, 'uP'),
+				uSrc: gl.getUniformLocation(prog, 'uSrc'),
+				uOmega: gl.getUniformLocation(prog, 'uOmega'),
+				uParity: gl.getUniformLocation(prog, 'uParity'),
+				uDim: gl.getUniformLocation(prog, 'uDim'),
+				uDiv: gl.getUniformLocation(prog, 'uDiv')
+			};
+		}
+
+		function prGlTexture(gl, dim, internalFormat) {
+			const tex = gl.createTexture();
+			gl.bindTexture(gl.TEXTURE_2D, tex);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+			gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+			gl.texStorage2D(gl.TEXTURE_2D, 1, internalFormat, dim, dim);
+			return tex;
+		}
+
+		function prGlInit() {
+			prGlInited = true;
+			try {
+				prGlCanvas = document.createElement('canvas');
+				prGlCanvas.width = 1;
+				prGlCanvas.height = 1;
+				prGl = prGlCanvas.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false, preserveDrawingBuffer: false });
+				if (!prGl || !prGl.getExtension('EXT_color_buffer_float')) throw new Error('no float targets');
+				const gl = prGl;
+				prGlCanvas.addEventListener('webglcontextlost', () => { prGlBroken = true; });
+
+				prGlSolve = prGlLink(gl, PR_FS_SOLVE);
+				prGlCopy = prGlLink(gl, PR_FS_COPY);
+				if (!prGlSolve || !prGlCopy) throw new Error('shader build failed');
+
+				gl.bindVertexArray(gl.createVertexArray());
+				gl.disable(gl.DEPTH_TEST);
+				gl.disable(gl.BLEND);
+				gl.disable(gl.SCISSOR_TEST);
+				gl.clearColor(0, 0, 0, 0);
+
+				prGlSrcTex = new Array(PR_LEVELS);
+				prGlPTex = new Array(PR_LEVELS);
+				prGlCur = new Int32Array(PR_LEVELS);
+				for (let k = 0; k < PR_LEVELS; k++) {
+					const dim = prLvlDim[k];
+					prGlSrcTex[k] = prGlTexture(gl, dim, gl.RG32F);
+					prGlPTex[k] = [prGlTexture(gl, dim, gl.R32F), prGlTexture(gl, dim, gl.R32F)];
+				}
+				prGlReadTex = prGlTexture(gl, PR_DIM, gl.RGBA32F);
+				prGlFbo = gl.createFramebuffer();
+
+				// Both attachment formats must be renderable on this driver.
+				gl.bindFramebuffer(gl.FRAMEBUFFER, prGlFbo);
+				gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, prGlPTex[0][0], 0);
+				if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('R32F not renderable');
+				gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, prGlReadTex, 0);
+				if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) throw new Error('RGBA32F not renderable');
+				gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+				prReadback = new Float32Array(PR_CELLS * 4);
+			} catch (e) {
+				prGlBroken = true;
+				prGl = null;
+			}
+		}
+
+		function prGpuAvailable() {
+			if (prGlBroken) return false;
+			if (!prWebglSupported()) return false;
+			if (!prGlInited) prGlInit();
+			return !prGlBroken && prGl !== null;
+		}
+
+		function prGlBindTarget(gl, tex, dim) {
+			gl.bindFramebuffer(gl.FRAMEBUFFER, prGlFbo);
+			gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+			gl.viewport(0, 0, dim, dim);
+		}
+
+		function prGlUploadLevel(gl, k) {
+			const dim = prLvlDim[k];
+			const n = dim * dim;
+			const mass = prLvlMass[k];
+			const cap = prLvlCap[k];
+			for (let i = 0, j = 0; i < n; i++, j += 2) {
+				prUpload[j] = mass[i];
+				prUpload[j + 1] = cap[i];
+			}
+			gl.bindTexture(gl.TEXTURE_2D, prGlSrcTex[k]);
+			gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, dim, dim, gl.RG, gl.FLOAT, prUpload, 0);
+		}
+
+		// Whole coarse-to-fine solve in one call: the GPU chews through it in
+		// a few milliseconds. Returns false if the result cannot be trusted,
+		// which permanently switches the mode over to the CPU solver.
+		function prSolveGpu() {
+			const gl = prGl;
+			try {
+				for (let k = 0; k < PR_LEVELS; k++) prGlUploadLevel(gl, k);
+
+				for (let k = PR_LEVELS - 1; k >= 0; k--) {
+					const dim = prLvlDim[k];
+					if (k === PR_LEVELS - 1) {
+						prGlBindTarget(gl, prGlPTex[k][0], dim);
+						gl.clear(gl.COLOR_BUFFER_BIT);
+					} else {
+						gl.useProgram(prGlCopy.prog);
+						gl.uniform1i(prGlCopy.uP, 0);
+						gl.uniform1i(prGlCopy.uSrc, 1);
+						gl.uniform1i(prGlCopy.uDiv, 2);
+						gl.activeTexture(gl.TEXTURE0);
+						gl.bindTexture(gl.TEXTURE_2D, prGlPTex[k + 1][prGlCur[k + 1]]);
+						gl.activeTexture(gl.TEXTURE1);
+						gl.bindTexture(gl.TEXTURE_2D, prGlSrcTex[k]);
+						prGlBindTarget(gl, prGlPTex[k][0], dim);
+						gl.drawArrays(gl.TRIANGLES, 0, 3);
+					}
+
+					let cur = 0;
+					gl.useProgram(prGlSolve.prog);
+					gl.uniform1i(prGlSolve.uP, 0);
+					gl.uniform1i(prGlSolve.uSrc, 1);
+					gl.uniform1f(prGlSolve.uOmega, PR_OMEGA);
+					gl.uniform1i(prGlSolve.uDim, dim);
+					gl.activeTexture(gl.TEXTURE1);
+					gl.bindTexture(gl.TEXTURE_2D, prGlSrcTex[k]);
+					const sweeps = k === 0 ? PR_SWEEPS * 2 : PR_SWEEPS;
+					for (let s = 0; s < sweeps; s++) {
+						for (let parity = 0; parity < 2; parity++) {
+							gl.uniform1i(prGlSolve.uParity, parity);
+							gl.activeTexture(gl.TEXTURE0);
+							gl.bindTexture(gl.TEXTURE_2D, prGlPTex[k][cur]);
+							prGlBindTarget(gl, prGlPTex[k][1 - cur], dim);
+							gl.drawArrays(gl.TRIANGLES, 0, 3);
+							cur = 1 - cur;
+						}
+					}
+					prGlCur[k] = cur;
+				}
+
+				// Pull the fine field back through an RGBA32F target: that is
+				// the readPixels combination every WebGL2 driver supports.
+				gl.useProgram(prGlCopy.prog);
+				gl.uniform1i(prGlCopy.uP, 0);
+				gl.uniform1i(prGlCopy.uSrc, 1);
+				gl.uniform1i(prGlCopy.uDiv, 1);
+				gl.activeTexture(gl.TEXTURE0);
+				gl.bindTexture(gl.TEXTURE_2D, prGlPTex[0][prGlCur[0]]);
+				gl.activeTexture(gl.TEXTURE1);
+				gl.bindTexture(gl.TEXTURE_2D, prGlSrcTex[0]);
+				prGlBindTarget(gl, prGlReadTex, PR_DIM);
+				gl.drawArrays(gl.TRIANGLES, 0, 3);
+				gl.readPixels(0, 0, PR_DIM, PR_DIM, gl.RGBA, gl.FLOAT, prReadback);
+				gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+				for (let i = 0, j = 0; i < PR_CELLS; i++, j += 4) prPressure[i] = prReadback[j];
+
+				const res = prResidual();
+				if (!(res >= 0) || res > PR_GPU_RES_LIMIT) throw new Error('bad solve');
+				return true;
+			} catch (e) {
+				prGlBroken = true;
+				return false;
+			}
 		}
 
 		// --- HEAD-TO-HEAD SPEED BENCHMARK ---
