@@ -492,14 +492,23 @@
 						<input type="range" id="max-pixels-slider" min="1000" max="100000" step="1000" value="50000">
 					</div>
 				</div>
-				<!-- Height Scale slider (visible only in Isometry Mode) -->
+				<!-- Tower controls (visible in both 3D modes) -->
 				<div class="control-group" id="height-scale-group" style="display: none;">
 					<div class="control-label">
-						<span>Skyscraper Height Scale</span>
+						<span>Tower Height Scale</span>
 						<span class="control-value" id="height-scale-val">1.0</span>
 					</div>
 					<div class="slider-container">
-						<input type="range" id="height-scale-slider" min="0.1" max="4.0" step="0.1" value="1.0">
+						<input type="range" id="height-scale-slider" min="0.1" max="4.0" step="0.1" value="1.0" aria-label="Tower height scale">
+					</div>
+				</div>
+				<div class="control-group" id="height-log-group" style="display: none;">
+					<div class="control-label">
+<span>Height Log Base</span>
+					<span class="control-value" id="height-log-val">Off</span>
+				</div>
+				<div class="slider-container">
+					<input type="range" id="height-log-slider" min="0.8" max="1.5" step="0.02" value="1" aria-label="Tower height logarithm base; 1.00 keeps linear heights, above 1 shrinks them, below 1 expands them">
 					</div>
 				</div>
 			</div>
@@ -571,6 +580,24 @@
 		const isoCellCurrentOffset = new Int32Array(ISO_GRID_CELLS);
 		const isoSortedColors = new Uint32Array(120000); // Max safe capacity for 100k resampled pixels
 
+		// Light towers aggregate exact RGB colors in a fixed open-addressing table.
+		// Saturation is deliberately ignored when positioning these towers.
+		const LT_HASH_CAPACITY = 262144;
+		const LT_HASH_MASK = LT_HASH_CAPACITY - 1;
+		const LT_MAX_TOWERS = 120000;
+		const LT_MAX_HEIGHT = 220;
+		const ltColorKeys = new Uint32Array(LT_HASH_CAPACITY);
+		const ltColorCounts = new Uint32Array(LT_HASH_CAPACITY);
+		const ltOccupiedSlots = new Uint32Array(LT_MAX_TOWERS);
+		const ltTowerX = new Int16Array(LT_MAX_TOWERS);
+		const ltTowerY = new Int16Array(LT_MAX_TOWERS);
+		const ltTowerHeight = new Uint16Array(LT_MAX_TOWERS);
+		const ltTowerColor = new Uint32Array(LT_MAX_TOWERS);
+		const ltDepthCount = new Uint32Array(ISO_GRID_DIM);
+		const ltDepthOffset = new Uint32Array(ISO_GRID_DIM);
+		const ltDepthCurrentOffset = new Uint32Array(ISO_GRID_DIM);
+		const ltSortedTowerIndices = new Uint32Array(LT_MAX_TOWERS);
+
 		// --- DOM ELEMENTS ---
 		const destCanvas = document.getElementById('hsl-canvas');
 		const destCtx = destCanvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -586,6 +613,9 @@
 		const heightScaleGroup = document.getElementById('height-scale-group');
 		const heightScaleSlider = document.getElementById('height-scale-slider');
 		const heightScaleVal = document.getElementById('height-scale-val');
+		const heightLogGroup = document.getElementById('height-log-group');
+		const heightLogSlider = document.getElementById('height-log-slider');
+		const heightLogVal = document.getElementById('height-log-val');
 		
 		const statsOrigRes = document.getElementById('stats-orig-res');
 		const statsResampledRes = document.getElementById('stats-resampled-res');
@@ -657,13 +687,17 @@
 				scheduleRender();
 			});
 
+			heightLogSlider.addEventListener('input', () => {
+				const base = parseFloat(heightLogSlider.value);
+				heightLogVal.textContent = base === 1 ? 'Off' : `base ${base.toFixed(2)}`;
+				scheduleRender();
+			});
+
 			engineSelector.addEventListener('change', () => {
 				const style = engineSelector.value;
-				if (style === 'isometry' || style === 'lighttowers') {
-					heightScaleGroup.style.display = 'block';
-				} else {
-					heightScaleGroup.style.display = 'none';
-				}
+				const is3D = style === 'isometry' || style === 'lighttowers';
+				heightScaleGroup.style.display = is3D ? 'block' : 'none';
+				heightLogGroup.style.display = is3D ? 'block' : 'none';
 				scheduleRender();
 			});
 
@@ -936,7 +970,7 @@
 		}
 
 		// --- BACKGROUND GUIDE ISOMETRY (TILTED 3D VIEW) ---
-		function drawBackgroundGuideIsometry(ctx, w, h, cx, cy, rMax) {
+		function drawBackgroundGuideIsometry(ctx, w, h, cx, cy, rMax, radialLabel = 'S') {
 			ctx.fillStyle = '#0c0c0f';
 			ctx.fillRect(0, 0, w, h);
 			
@@ -955,7 +989,7 @@
 				
 				// Label placed along the tilted edge
 				ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
-				ctx.fillText(`${Math.round(circles[i] * 100)}% S`, cx + r + 15, cy);
+				ctx.fillText(`${Math.round(circles[i] * 100)}% ${radialLabel}`, cx + r + 15, cy);
 			}
 			
 			// Radial lines on the tilted floor grid
@@ -1038,6 +1072,8 @@
 				const cyIso = 340; // Shifted down slightly to leave vertical space for skyscrapers
 				const R_max_iso = 180;
 				const heightScale = parseFloat(heightScaleSlider.value);
+				const heightLogBase = parseFloat(heightLogSlider.value);
+				const heightLogGain = 1 - Math.log(heightLogBase);
 
 				isoCellCount.fill(0);
 				isoCellOffset.fill(0);
@@ -1158,19 +1194,21 @@
 						const startOffset = isoCellOffset[gridIdx];
 						const baseSX = cxIso + gu;
 
-						// Draw the vertical tower pillar
-						for (let z = 0; z < count; z++) {
-							const color = isoSortedColors[startOffset + z];
-							const sy = Math.round(baseSY - z * heightScale);
+// Draw a solid pillar. The log base rescales the logarithm of the
+					// height: base 1 stays linear, above 1 shrinks, below 1 expands.
+						const displayHeight = Math.max(1, Math.round(Math.pow(count, heightLogGain) * heightScale));
 
-							if (sy >= 0 && sy < H) {
+						for (let z = 0; z < displayHeight; z++) {
+							const colorIndex = Math.min(count - 1, Math.floor((z + 0.5) * count / displayHeight));
+							const color = isoSortedColors[startOffset + colorIndex];
+							const sy = Math.round(baseSY - z);
+
+							if (sy >= 0 && sy < H && baseSX >= 1 && baseSX < W - 1) {
 								const gIdx = sy * W + baseSX;
 								// Draw 3px wide pillars for robust structural visibility
-								if (baseSX >= 1 && baseSX < W - 1) {
-									grid[gIdx - 1] = color;
-									grid[gIdx] = color;
-									grid[gIdx + 1] = color;
-								}
+								grid[gIdx - 1] = color;
+								grid[gIdx] = color;
+								grid[gIdx + 1] = color;
 							}
 						}
 						placedCount += count;
@@ -1183,11 +1221,130 @@
 				destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
 
 			} else if (vizStyle === 'lighttowers') {
+				// --- 3D LIGHT TOWERS: COUNT -> RADIUS, HUE -> ANGLE, LIGHT -> HEIGHT ---
+				const cxLT = 300;
+				const cyLT = 350;
+				const R_max_lt = 180;
+				const heightScale = parseFloat(heightScaleSlider.value);
+				const heightLogBase = parseFloat(heightLogSlider.value);
+				const heightLogGain = 1 - Math.log(heightLogBase);
 
+				ltColorKeys.fill(0);
+				ltColorCounts.fill(0);
+				ltDepthCount.fill(0);
+				ltDepthOffset.fill(0);
+				ltDepthCurrentOffset.fill(0);
 
-				// Render out the light towers view
+				let towerCount = 0;
+				let maxColorCount = 0;
+
+				// Aggregate equal RGB pixels. The table uses RGB + 1 so zero remains
+				// the empty-slot marker, including for pure black source pixels.
+				for (let i = 0; i < pixelCount; i++) {
+					const srcIdx = i * 4;
+					if (srcData[srcIdx + 3] < 10) continue;
+
+					const r = srcData[srcIdx];
+					const g = srcData[srcIdx + 1];
+					const b = srcData[srcIdx + 2];
+					const key = ((r << 16) | (g << 8) | b) + 1;
+					let slot = Math.imul(key, 0x9E3779B1) & LT_HASH_MASK;
+
+					while (true) {
+						const existingKey = ltColorKeys[slot];
+						if (existingKey === 0) {
+							ltColorKeys[slot] = key;
+							ltColorCounts[slot] = 1;
+							ltOccupiedSlots[towerCount++] = slot;
+							if (maxColorCount === 0) maxColorCount = 1;
+							break;
+						}
+						if (existingKey === key) {
+							const count = ++ltColorCounts[slot];
+							if (count > maxColorCount) maxColorCount = count;
+							break;
+						}
+						slot = (slot + 1) & LT_HASH_MASK;
+					}
+					placedCount++;
+				}
+
+				// Convert each distinct color into a tower. Count is normalized against
+				// the most frequent color so the complete count range fits the island.
+				for (let i = 0; i < towerCount; i++) {
+					const slot = ltOccupiedSlots[i];
+					const rgb = ltColorKeys[slot] - 1;
+					const r = rgb >>> 16;
+					const g = (rgb >>> 8) & 255;
+					const b = rgb & 255;
+
+					const max = r > g ? (r > b ? r : b) : (g > b ? g : b);
+					const min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+					const d = max - min;
+					let h = 0;
+
+					if (d !== 0) {
+						if (max === r) {
+							h = (g - b) / d + (g < b ? 6 : 0);
+						} else if (max === g) {
+							h = (b - r) / d + 2;
+						} else {
+							h = (r - g) / d + 4;
+						}
+						h /= 6;
+					}
+
+					const lightness = (max + min) / 510;
+					const theta = h * 2 * Math.PI;
+					const radius = (ltColorCounts[slot] / maxColorCount) * R_max_lt;
+					const gu = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(radius * Math.cos(theta))));
+					const gv = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(radius * Math.sin(theta))));
+
+					ltTowerX[i] = gu;
+					ltTowerY[i] = gv;
+					ltTowerHeight[i] = Math.round(lightness * LT_MAX_HEIGHT);
+					ltTowerColor[i] = 0xFF000000 | (b << 16) | (g << 8) | r;
+					ltDepthCount[gv + ISO_GRID_BOUNDS]++;
+				}
+
+				// Counting-sort towers by floor depth for back-to-front occlusion.
+				let depthSum = 0;
+				for (let i = 0; i < ISO_GRID_DIM; i++) {
+					ltDepthOffset[i] = depthSum;
+					ltDepthCurrentOffset[i] = depthSum;
+					depthSum += ltDepthCount[i];
+				}
+				for (let i = 0; i < towerCount; i++) {
+					const depthIdx = ltTowerY[i] + ISO_GRID_BOUNDS;
+					ltSortedTowerIndices[ltDepthCurrentOffset[depthIdx]++] = i;
+				}
+
+				for (let depthIdx = 0; depthIdx < ISO_GRID_DIM; depthIdx++) {
+					const end = ltDepthOffset[depthIdx] + ltDepthCount[depthIdx];
+					for (let sortedIdx = ltDepthOffset[depthIdx]; sortedIdx < end; sortedIdx++) {
+						const towerIdx = ltSortedTowerIndices[sortedIdx];
+						const baseSX = cxLT + ltTowerX[towerIdx];
+						const baseSY = cyLT + ltTowerY[towerIdx] * 0.5;
+						const rawHeight = ltTowerHeight[towerIdx];
+						const displayHeight = Math.max(1, Math.round(Math.pow(rawHeight, heightLogGain) * heightScale));
+						const color = ltTowerColor[towerIdx];
+
+						for (let z = 0; z < displayHeight; z++) {
+							const sy = Math.round(baseSY - z);
+							if (sy >= 0 && sy < H && baseSX >= 1 && baseSX < W - 1) {
+								const gIdx = sy * W + baseSX;
+								grid[gIdx - 1] = color;
+								grid[gIdx] = color;
+								grid[gIdx + 1] = color;
+							}
+						}
+					}
+				}
+
+				// Render out the light towers view. Radius labels represent each
+				// color's count as a percentage of the largest color population.
 				offscreenPlacementCtx.putImageData(destImgData, 0, 0);
-				drawBackgroundGuideIsometry(destCtx, W, H, cxLT, cyLT, R_max_lt);
+				drawBackgroundGuideIsometry(destCtx, W, H, cxLT, cyLT, R_max_lt, 'max count');
 				destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
 
 			} else {
