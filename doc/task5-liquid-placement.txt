@@ -1,0 +1,2 @@
+add 3D draw mode:
+	same as 3D Isometric Skyscrapers but after calculated Skyscrapers it relaxed as immiscible liquids - pushing other pixels. draw animated relaxation simulation. think how properly do this.

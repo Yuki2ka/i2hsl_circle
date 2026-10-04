@@ -1,0 +1,959 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="UTF-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<title>HSL Pixel Swarm Visualizer</title>
+	<style>
+		:root {
+			--bg-main: #0a0a0c;
+			--bg-panel: #131318;
+			--bg-control: #1d1d26;
+			--border-color: #2b2b3a;
+			--text-main: #e4e4e7;
+			--text-muted: #a1a1aa;
+			--accent: #6366f1;
+			--accent-hover: #4f46e5;
+			--accent-light: rgba(99, 102, 241, 0.15);
+		}
+
+		* {
+			box-sizing: border-box;
+			margin: 0;
+			padding: 0;
+		}
+
+		body {
+			background-color: var(--bg-main);
+			color: var(--text-main);
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+			min-height: 100vh;
+			display: flex;
+			flex-direction: column;
+		}
+
+		header {
+			padding: 20px 40px;
+			border-bottom: 1px solid var(--border-color);
+			background-color: var(--bg-panel);
+			display: flex;
+			justify-content: space-between;
+			align-items: center;
+		}
+
+		h1 {
+			font-size: 20px;
+			font-weight: 700;
+			letter-spacing: -0.025em;
+			color: #ffffff;
+			display: flex;
+			align-items: center;
+			gap: 10px;
+		}
+
+		h1 span {
+			background: linear-gradient(135deg, #a5b4fc, var(--accent));
+			-webkit-background-clip: text;
+			-webkit-text-fill-color: transparent;
+		}
+
+		.subtitle {
+			font-size: 12px;
+			color: var(--text-muted);
+			margin-top: 2px;
+		}
+
+		main {
+			flex: 1;
+			display: grid;
+			grid-template-columns: 1fr 380px;
+			gap: 30px;
+			padding: 30px 40px;
+			max-width: 1400px;
+			margin: 0 auto;
+			width: 100%;
+		}
+
+		@media (max-width: 1024px) {
+			main {
+				grid-template-columns: 1fr;
+				padding: 20px;
+				gap: 20px;
+			}
+		}
+
+		.canvas-card {
+			background-color: var(--bg-panel);
+			border: 1px solid var(--border-color);
+			border-radius: 16px;
+			padding: 24px;
+			display: flex;
+			flex-direction: column;
+			align-items: center;
+			justify-content: center;
+			position: relative;
+			box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+		}
+
+		#canvas-container {
+			position: relative;
+			width: 100%;
+			max-width: 600px;
+			aspect-ratio: 1/1;
+			background-color: #0b0b0e;
+			border-radius: 12px;
+			overflow: hidden;
+			border: 1px solid rgba(255, 255, 255, 0.05);
+		}
+
+		#hsl-canvas {
+			display: block;
+			width: 100%;
+			height: 100%;
+		}
+
+		#drop-overlay {
+			position: absolute;
+			top: 0;
+			left: 0;
+			width: 100%;
+			height: 100%;
+			background-color: rgba(99, 102, 241, 0.9);
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			opacity: 0;
+			pointer-events: none;
+			transition: opacity 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+			z-index: 10;
+		}
+
+		#canvas-container.drag-over #drop-overlay {
+			opacity: 1;
+		}
+
+		.overlay-content {
+			text-align: center;
+			color: #ffffff;
+		}
+
+		.overlay-title {
+			font-size: 24px;
+			font-weight: 700;
+			margin-bottom: 8px;
+		}
+
+		.overlay-sub {
+			font-size: 14px;
+			opacity: 0.8;
+		}
+
+		.sidebar {
+			display: flex;
+			flex-direction: column;
+			gap: 20px;
+		}
+
+		.panel {
+			background-color: var(--bg-panel);
+			border: 1px solid var(--border-color);
+			border-radius: 16px;
+			padding: 24px;
+			box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+		}
+
+		.panel-title {
+			font-size: 14px;
+			font-weight: 600;
+			text-transform: uppercase;
+			letter-spacing: 0.05em;
+			color: var(--text-muted);
+			margin-bottom: 16px;
+			display: flex;
+			align-items: center;
+			justify-content: space-between;
+		}
+
+		.control-group {
+			margin-bottom: 20px;
+		}
+
+		.control-group:last-child {
+			margin-bottom: 0;
+		}
+
+		.control-label {
+			display: flex;
+			justify-content: space-between;
+			font-size: 13px;
+			font-weight: 500;
+			margin-bottom: 8px;
+			color: var(--text-main);
+		}
+
+		.control-value {
+			font-family: monospace;
+			color: var(--accent);
+			font-weight: 600;
+		}
+
+		/* Custom Slider Styling */
+		.slider-container {
+			display: flex;
+			align-items: center;
+			gap: 12px;
+		}
+
+		input[type="range"] {
+			-webkit-appearance: none;
+			width: 100%;
+			height: 6px;
+			background: var(--bg-control);
+			border-radius: 3px;
+			outline: none;
+			border: 1px solid var(--border-color);
+		}
+
+		input[type="range"]::-webkit-slider-thumb {
+			-webkit-appearance: none;
+			width: 18px;
+			height: 18px;
+			border-radius: 50%;
+			background: var(--accent);
+			cursor: pointer;
+			transition: background 0.15s;
+			border: 2px solid var(--bg-panel);
+			box-shadow: 0 0 8px rgba(99, 102, 241, 0.5);
+		}
+
+		input[type="range"]::-webkit-slider-thumb:hover {
+			background: var(--accent-hover);
+		}
+
+		/* Button styling */
+		.btn {
+			display: inline-flex;
+			align-items: center;
+			justify-content: center;
+			background-color: var(--bg-control);
+			color: var(--text-main);
+			border: 1px solid var(--border-color);
+			padding: 10px 16px;
+			border-radius: 8px;
+			font-size: 13px;
+			font-weight: 500;
+			cursor: pointer;
+			transition: all 0.15s ease;
+			width: 100%;
+			gap: 8px;
+		}
+
+		.btn:hover {
+			background-color: var(--accent-light);
+			border-color: var(--accent);
+			color: #ffffff;
+		}
+
+		.btn-primary {
+			background-color: var(--accent);
+			border-color: var(--accent);
+			color: #ffffff;
+		}
+
+		.btn-primary:hover {
+			background-color: var(--accent-hover);
+			border-color: var(--accent-hover);
+		}
+
+		/* Preset grid */
+		.preset-grid {
+			display: grid;
+			grid-template-columns: repeat(2, 1fr);
+			gap: 8px;
+		}
+
+		.preset-btn {
+			font-size: 12px;
+			padding: 8px;
+			border-radius: 6px;
+		}
+
+		/* Stats list */
+		.stats-list {
+			display: flex;
+			flex-direction: column;
+			gap: 12px;
+		}
+
+		.stats-item {
+			display: flex;
+			justify-content: space-between;
+			font-size: 13px;
+			border-bottom: 1px dashed var(--border-color);
+			padding-bottom: 8px;
+		}
+
+		.stats-item:last-child {
+			border-bottom: none;
+			padding-bottom: 0;
+		}
+
+		.stats-label {
+			color: var(--text-muted);
+		}
+
+		.stats-val {
+			font-family: monospace;
+			font-weight: 600;
+		}
+
+		/* Preview thumbnail */
+		.preview-box {
+			width: 100%;
+			height: 120px;
+			background-color: var(--bg-control);
+			border: 1px dashed var(--border-color);
+			border-radius: 8px;
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			overflow: hidden;
+			position: relative;
+		}
+
+		.preview-box img, .preview-box canvas {
+			max-width: 100%;
+			max-height: 100%;
+			object-fit: contain;
+		}
+
+		.preview-placeholder {
+			font-size: 12px;
+			color: var(--text-muted);
+			text-align: center;
+		}
+
+		footer {
+			text-align: center;
+			padding: 20px;
+			font-size: 11px;
+			color: var(--text-muted);
+			border-top: 1px solid var(--border-color);
+			margin-top: auto;
+			background-color: var(--bg-panel);
+		}
+
+		/* Toast alert */
+		#toast {
+			position: fixed;
+			bottom: 24px;
+			right: 24px;
+			background-color: #10b981;
+			color: white;
+			padding: 12px 24px;
+			border-radius: 8px;
+			font-weight: 500;
+			font-size: 14px;
+			box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+			transform: translateY(100px);
+			opacity: 0;
+			transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+			z-index: 100;
+		}
+
+		#toast.show {
+			transform: translateY(0);
+			opacity: 1;
+		}
+	</style>
+</head>
+<body>
+
+	<header>
+		<div>
+			<h1><span>HSL Pixel Swarm Visualizer</span></h1>
+			<div class="subtitle">Vanilla JS • High Performance Particle Mapping</div>
+		</div>
+		<div style="font-size: 12px; color: var(--text-muted); font-family: monospace;">
+			Ver 1.0.0
+		</div>
+	</header>
+
+	<main>
+		<!-- Left: Visualizer Canvas -->
+		<div class="canvas-card">
+			<div id="canvas-container">
+				<canvas id="hsl-canvas" width="600" height="600"></canvas>
+				<div id="drop-overlay">
+					<div class="overlay-content">
+						<div class="overlay-title">Drop Image Here</div>
+						<div class="overlay-sub">Supports JPG, PNG, WEBP</div>
+					</div>
+				</div>
+			</div>
+		</div>
+
+		<!-- Right: Sidebar Controls -->
+		<div class="sidebar">
+			<!-- Image Source Panel -->
+			<div class="panel">
+				<div class="panel-title">
+					<span>Image Source</span>
+				</div>
+				<div class="control-group">
+					<div class="preview-box" id="image-preview-container">
+						<div class="preview-placeholder" id="preview-placeholder">No image loaded</div>
+						<canvas id="preview-canvas" style="display: none;"></canvas>
+					</div>
+				</div>
+				<div class="control-group">
+					<button class="btn btn-primary" id="btn-select">
+						Select Image File
+					</button>
+					<input type="file" id="file-input" accept="image/*" style="display: none;">
+				</div>
+			</div>
+
+			<!-- Presets Panel -->
+			<div class="panel">
+				<div class="panel-title">
+					<span>Synthetic Presets</span>
+				</div>
+				<div class="preset-grid">
+					<button class="btn preset-btn" data-preset="wheel">Rainbow Wheel</button>
+					<button class="btn preset-btn" data-preset="blocks">Color Blocks</button>
+					<button class="btn preset-btn" data-preset="sunset">Vibrant Sunset</button>
+					<button class="btn preset-btn" data-preset="noise">Random Noise</button>
+				</div>
+			</div>
+
+			<!-- Controls Panel -->
+			<div class="panel">
+				<div class="panel-title">
+					<span>Configuration</span>
+				</div>
+				<div class="control-group">
+					<div class="control-label">
+						<span>Max Resampled Pixels</span>
+						<span class="control-value" id="max-pixels-val">50,000</span>
+					</div>
+					<div class="slider-container">
+						<input type="range" id="max-pixels-slider" min="1000" max="100000" step="1000" value="50000">
+					</div>
+				</div>
+			</div>
+
+			<!-- Statistics Panel -->
+			<div class="panel">
+				<div class="panel-title">
+					<span>Performance &amp; Scale</span>
+				</div>
+				<div class="stats-list">
+					<div class="stats-item">
+						<span class="stats-label">Original Resolution</span>
+						<span class="stats-val" id="stats-orig-res">-</span>
+					</div>
+					<div class="stats-item">
+						<span class="stats-label">Resampled Resolution</span>
+						<span class="stats-val" id="stats-resampled-res">-</span>
+					</div>
+					<div class="stats-item">
+						<span class="stats-label">Pixels Placed</span>
+						<span class="stats-val" id="stats-pixels-placed">-</span>
+					</div>
+					<div class="stats-item">
+						<span class="stats-label">Hot-path Placement Time</span>
+						<span class="stats-val" style="color: #10b981;" id="stats-time">-</span>
+					</div>
+				</div>
+			</div>
+		</div>
+	</main>
+
+	<footer>
+		HSL Pixel Swarm Visualizer • Optimized density distribution with zero-allocation JIT hot paths
+	</footer>
+
+	<div id="toast">Image loaded successfully!</div>
+
+	<script>
+		// --- CONFIG & CONSTANTS ---
+		const W = 600;
+		const H = 600;
+		const cx = W / 2;
+		const cy = H / 2;
+		const R_max = 240; // max radius inside canvas to fit comfortably
+
+		// Pre-allocated arrays for spiral offsets
+		const MAX_SPIRAL_OFFSETS = 150000;
+		const spiralX = new Int16Array(MAX_SPIRAL_OFFSETS);
+		const spiralY = new Int16Array(MAX_SPIRAL_OFFSETS);
+
+		// --- PRE-ALLOCATED WEB RESOURCES FOR HOT PATH (ZERO ALLOCATION) ---
+		let occupied = new Uint8Array(W * H);
+		let lastSpiralIndex = new Uint32Array(W * H);
+
+		// --- DOM ELEMENTS ---
+		const destCanvas = document.getElementById('hsl-canvas');
+		const destCtx = destCanvas.getContext('2d', { alpha: false, desynchronized: true });
+		
+		const canvasContainer = document.getElementById('canvas-container');
+		const fileInput = document.getElementById('file-input');
+		const btnSelect = document.getElementById('btn-select');
+		
+		const maxPixelsSlider = document.getElementById('max-pixels-slider');
+		const maxPixelsVal = document.getElementById('max-pixels-val');
+		
+		const statsOrigRes = document.getElementById('stats-orig-res');
+		const statsResampledRes = document.getElementById('stats-resampled-res');
+		const statsPixelsPlaced = document.getElementById('stats-pixels-placed');
+		const statsTime = document.getElementById('stats-time');
+		
+		const previewCanvas = document.getElementById('preview-canvas');
+		const previewCtx = previewCanvas.getContext('2d');
+		const previewPlaceholder = document.getElementById('preview-placeholder');
+		const toast = document.getElementById('toast');
+
+		// --- STATE ---
+		let currentImage = null; // Can be Image or Canvas (preset)
+		let originalWidth = 0;
+		let originalHeight = 0;
+
+		// --- OFFSCREEN CANVASES (REUSED TO AVOID ALLOCATIONS) ---
+		const offscreenCanvas = document.createElement('canvas');
+		const offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+
+		const offscreenPlacementCanvas = document.createElement('canvas');
+		offscreenPlacementCanvas.width = W;
+		offscreenPlacementCanvas.height = H;
+		const offscreenPlacementCtx = offscreenPlacementCanvas.getContext('2d');
+		const destImgData = offscreenPlacementCtx.createImageData(W, H);
+		const grid = new Uint32Array(destImgData.data.buffer);
+
+		// --- INITIALIZATION ---
+		function init() {
+			initSpiral();
+			setupEventListeners();
+			loadPreset('wheel');
+		}
+
+		// Pre-generate a compact square spiral offset sequence
+		function initSpiral() {
+			let x = 0;
+			let y = 0;
+			let dx = 0;
+			let dy = -1;
+			for (let i = 0; i < MAX_SPIRAL_OFFSETS; i++) {
+				spiralX[i] = x;
+				spiralY[i] = y;
+				if (x === y || (x < 0 && x === -y) || (x > 0 && x === 1 - y)) {
+					const temp = dx;
+					dx = -dy;
+					dy = temp;
+				}
+				x += dx;
+				y += dy;
+			}
+		}
+
+		function setupEventListeners() {
+			// Slider changes (live rendering using requestAnimationFrame)
+			maxPixelsSlider.addEventListener('input', () => {
+				maxPixelsVal.textContent = parseInt(maxPixelsSlider.value, 10).toLocaleString();
+				scheduleRender();
+			});
+
+			// Select File Button
+			btnSelect.addEventListener('click', () => fileInput.click());
+			fileInput.addEventListener('change', handleFileSelect);
+
+			// Drag and Drop
+			window.addEventListener('dragover', (e) => {
+				e.preventDefault();
+				canvasContainer.classList.add('drag-over');
+			});
+
+			window.addEventListener('dragleave', (e) => {
+				if (e.relatedTarget === null) {
+					canvasContainer.classList.remove('drag-over');
+				}
+			});
+
+			window.addEventListener('drop', (e) => {
+				e.preventDefault();
+				canvasContainer.classList.remove('drag-over');
+				if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+					loadImageFile(e.dataTransfer.files[0]);
+				}
+			});
+
+			// Presets
+			document.querySelectorAll('.preset-btn').forEach(btn => {
+				btn.addEventListener('click', (e) => {
+					loadPreset(e.target.dataset.preset);
+				});
+			});
+		}
+
+		// --- PRESETS GENERATOR ---
+		function loadPreset(type) {
+			previewPlaceholder.style.display = 'none';
+			previewCanvas.style.display = 'block';
+			
+			previewCanvas.width = 160;
+			previewCanvas.height = 120;
+			
+			const w = previewCanvas.width;
+			const h = previewCanvas.height;
+			
+			if (type === 'wheel') {
+				generateRainbowWheel(previewCtx, w, h);
+			} else if (type === 'blocks') {
+				generateColorBlocks(previewCtx, w, h);
+			} else if (type === 'sunset') {
+				generateVibrantSunset(previewCtx, w, h);
+			} else if (type === 'noise') {
+				generateRandomNoise(previewCtx, w, h);
+			}
+
+			currentImage = previewCanvas;
+			originalWidth = 400; // virtual source dimensions for preset
+			originalHeight = 300;
+			
+			statsOrigRes.textContent = `${originalWidth} × ${originalHeight}`;
+			scheduleRender();
+		}
+
+		function generateRainbowWheel(ctx, w, h) {
+			const imgData = ctx.createImageData(w, h);
+			const data = imgData.data;
+			const cx = w / 2;
+			const cy = h / 2;
+			const rMax = Math.min(cx, cy) * 0.9;
+			
+			let idx = 0;
+			for (let y = 0; y < h; y++) {
+				for (let x = 0; x < w; x++) {
+					const dx = x - cx;
+					const dy = y - cy;
+					const dist = Math.sqrt(dx * dx + dy * dy);
+					if (dist <= rMax) {
+						const angle = Math.atan2(dy, dx); // -PI to PI
+						const hue = (angle + Math.PI) / (2 * Math.PI);
+						const sat = dist / rMax;
+						const rgb = hslToRgb(hue, sat, 0.5);
+						data[idx] = rgb[0];
+						data[idx+1] = rgb[1];
+						data[idx+2] = rgb[2];
+						data[idx+3] = 255;
+					} else {
+						data[idx] = 11;
+						data[idx+1] = 11;
+						data[idx+2] = 14;
+						data[idx+3] = 255;
+					}
+					idx += 4;
+				}
+			}
+			ctx.putImageData(imgData, 0, 0);
+		}
+
+		function generateColorBlocks(ctx, w, h) {
+			ctx.fillStyle = '#0b0b0e';
+			ctx.fillRect(0, 0, w, h);
+			const colors = ['#ff3b30', '#4cd964', '#007aff', '#ffcc00', '#5ac8fa', '#5856d6', '#ff2d55', '#ffffff'];
+			const cols = 4;
+			const rows = 2;
+			const cellW = w / cols;
+			const cellH = h / rows;
+			let cIdx = 0;
+			for (let r = 0; r < rows; r++) {
+				for (let c = 0; c < cols; c++) {
+					if (cIdx >= colors.length) break;
+					ctx.fillStyle = colors[cIdx++];
+					ctx.fillRect(c * cellW + 4, r * cellH + 4, cellW - 8, cellH - 8);
+				}
+			}
+		}
+
+		function generateVibrantSunset(ctx, w, h) {
+			const grad = ctx.createLinearGradient(0, h, 0, 0);
+			grad.addColorStop(0, '#1a0b2e');
+			grad.addColorStop(0.25, '#5c0c43');
+			grad.addColorStop(0.5, '#b81d3d');
+			grad.addColorStop(0.75, '#e05c1d');
+			grad.addColorStop(1, '#ffcc00');
+			ctx.fillStyle = grad;
+			ctx.fillRect(0, 0, w, h);
+		}
+
+		function generateRandomNoise(ctx, w, h) {
+			const imgData = ctx.createImageData(w, h);
+			const data = imgData.data;
+			const len = data.length;
+			for (let i = 0; i < len; i += 4) {
+				data[i] = Math.floor(Math.random() * 256);
+				data[i+1] = Math.floor(Math.random() * 256);
+				data[i+2] = Math.floor(Math.random() * 256);
+				data[i+3] = 255;
+			}
+			ctx.putImageData(imgData, 0, 0);
+		}
+
+		function hslToRgb(h, s, l) {
+			let r, g, b;
+			if (s === 0) {
+				r = g = b = l;
+			} else {
+				const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+				const p = 2 * l - q;
+				r = hueToRgb(p, q, h + 1/3);
+				g = hueToRgb(p, q, h);
+				b = hueToRgb(p, q, h - 1/3);
+			}
+			return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255)];
+		}
+
+		function hueToRgb(p, q, t) {
+			if (t < 0) t += 1;
+			if (t > 1) t -= 1;
+			if (t < 1/6) return p + (q - p) * 6 * t;
+			if (t < 1/2) return q;
+			if (t < 2/3) return p + (q - p) * (2/3 - t) * 6;
+			return p;
+		}
+
+		// --- FILE PROCESSING ---
+		function handleFileSelect(e) {
+			if (e.target.files && e.target.files[0]) {
+				loadImageFile(e.target.files[0]);
+			}
+		}
+
+		function loadImageFile(file) {
+			if (!file.type.startsWith('image/')) return;
+			const reader = new FileReader();
+			reader.onload = (e) => {
+				const img = new Image();
+				img.onload = () => {
+					currentImage = img;
+					originalWidth = img.width;
+					originalHeight = img.height;
+					
+					// Draw preview thumbnail
+					previewPlaceholder.style.display = 'none';
+					previewCanvas.style.display = 'block';
+					
+					const ar = img.width / img.height;
+					let pw = 160;
+					let ph = 120;
+					if (ar > 1.33) {
+						ph = 160 / ar;
+					} else {
+						pw = 120 * ar;
+					}
+					previewCanvas.width = pw;
+					previewCanvas.height = ph;
+					previewCtx.drawImage(img, 0, 0, pw, ph);
+
+					statsOrigRes.textContent = `${originalWidth} × ${originalHeight}`;
+					showToast();
+					scheduleRender();
+				};
+				img.src = e.target.result;
+			};
+			reader.readAsDataURL(file);
+		}
+
+		function showToast() {
+			toast.classList.add('show');
+			setTimeout(() => {
+				toast.classList.remove('show');
+			}, 3000);
+		}
+
+		// --- BACKGROUND GUIDE ---
+		function drawBackgroundGuide(ctx, w, h, cx, cy, rMax) {
+			ctx.fillStyle = '#0c0c0f';
+			ctx.fillRect(0, 0, w, h);
+			
+			// Faint grid concentric circles (representing Saturation levels)
+			ctx.lineWidth = 1;
+			const circles = [0.25, 0.5, 0.75, 1.0];
+			ctx.font = '10px monospace';
+			ctx.textAlign = 'center';
+			ctx.textBaseline = 'bottom';
+			
+			for (let i = 0; i < circles.length; i++) {
+				const r = rMax * circles[i];
+				ctx.beginPath();
+				ctx.arc(cx, cy, r, 0, Math.PI * 2);
+				ctx.strokeStyle = 'rgba(255, 255, 255, 0.06)';
+				ctx.stroke();
+				
+				// Label
+				ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+				ctx.fillText(`${Math.round(circles[i] * 100)}% S`, cx, cy - r - 2);
+			}
+			
+			// Radial lines (representing Hue angles)
+			ctx.textAlign = 'center';
+			ctx.textBaseline = 'middle';
+			for (let deg = 0; deg < 360; deg += 30) {
+				const rad = (deg * Math.PI) / 180;
+				const cos = Math.cos(rad);
+				const sin = Math.sin(rad);
+				
+				ctx.beginPath();
+				ctx.moveTo(cx, cy);
+				ctx.lineTo(cx + rMax * cos, cy + rMax * sin);
+				ctx.strokeStyle = 'rgba(255, 255, 255, 0.04)';
+				ctx.stroke();
+				
+				// Text labels
+				const labelR = rMax + 14;
+				const lx = cx + labelR * cos;
+				const ly = cy + labelR * sin;
+				
+				let colorGuide = '';
+				if (deg === 0) colorGuide = ' (Red)';
+				else if (deg === 60) colorGuide = ' (Yellow)';
+				else if (deg === 120) colorGuide = ' (Green)';
+				else if (deg === 180) colorGuide = ' (Cyan)';
+				else if (deg === 240) colorGuide = ' (Blue)';
+				else if (deg === 300) colorGuide = ' (Magenta)';
+				
+				ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+				ctx.fillText(`${deg}°${colorGuide}`, lx, ly);
+			}
+		}
+
+		// --- ANIMATION FRAME THROTTLE ---
+		let isRenderScheduled = false;
+		function scheduleRender() {
+			if (isRenderScheduled) return;
+			isRenderScheduled = true;
+			requestAnimationFrame(() => {
+				render();
+				isRenderScheduled = false;
+			});
+		}
+
+		// --- MAIN HIGH-PERFORMANCE PLACEMENT ENGINE ---
+		function render() {
+			if (!currentImage) return;
+
+			const startTime = performance.now();
+			const maxPixels = parseInt(maxPixelsSlider.value, 10);
+
+			// Calculate resampled width and height preserving aspect ratio
+			const ar = originalWidth / originalHeight;
+			let srcW = Math.sqrt(maxPixels * ar);
+			let srcH = Math.sqrt(maxPixels / ar);
+			srcW = Math.max(1, Math.round(srcW));
+			srcH = Math.max(1, Math.round(srcH));
+
+			statsResampledRes.textContent = `${srcW} × ${srcH}`;
+
+			// Downscale image to offscreen canvas
+			offscreenCanvas.width = srcW;
+			offscreenCanvas.height = srcH;
+			offscreenCtx.drawImage(currentImage, 0, 0, srcW, srcH);
+
+			const srcImgData = offscreenCtx.getImageData(0, 0, srcW, srcH);
+			const srcData = srcImgData.data;
+			const pixelCount = srcW * srcH;
+
+			// Clear pre-allocated typed arrays (lightning fast)
+			grid.fill(0);
+			occupied.fill(0);
+			lastSpiralIndex.fill(0);
+
+			// Core allocation-free hot path loop
+			const maxOffsets = MAX_SPIRAL_OFFSETS;
+			let placedCount = 0;
+
+			for (let i = 0; i < pixelCount; i++) {
+				const srcIdx = i * 4;
+				const r = srcData[srcIdx];
+				const g = srcData[srcIdx + 1];
+				const b = srcData[srcIdx + 2];
+				const a = srcData[srcIdx + 3];
+
+				// Skip completely transparent pixels
+				if (a < 10) continue;
+
+				// Fast RGB to HSL math (completely allocation-free)
+				const rf = r / 255;
+				const gf = g / 255;
+				const bf = b / 255;
+				
+				const max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+				const min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+				
+				let h = 0;
+				let s = 0;
+				const l = (max + min) * 0.5;
+
+				if (max !== min) {
+					const d = max - min;
+					s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+					if (max === rf) {
+						h = (gf - bf) / d + (gf < bf ? 6 : 0);
+					} else if (max === gf) {
+						h = (bf - rf) / d + 2;
+					} else {
+						h = (rf - gf) / d + 4;
+					}
+					h /= 6;
+				}
+
+				// Convert polar coordinates (Hue = Angle, Saturation = Radial Distance)
+				const theta = h * 2 * Math.PI;
+				const r_dist = s * R_max;
+				const tx = Math.round(cx + r_dist * Math.cos(theta));
+				const ty = Math.round(cy + r_dist * Math.sin(theta));
+
+				const idx = ty * W + tx;
+				
+				// Find first empty pixel in the spiral sequence starting from last index
+				let k = lastSpiralIndex[idx];
+				while (k < maxOffsets) {
+					const dx = spiralX[k];
+					const dy = spiralY[k];
+					const px = tx + dx;
+					const py = ty + dy;
+
+					if (px >= 0 && px < W && py >= 0 && py < H) {
+						const gIdx = py * W + px;
+						if (occupied[gIdx] === 0) {
+							occupied[gIdx] = 1;
+							// Write pixel color directly to ABGR Uint32 buffer (little endian representation)
+							grid[gIdx] = 0xFF000000 | (b << 16) | (g << 8) | r;
+							lastSpiralIndex[idx] = k;
+							placedCount++;
+							break;
+						}
+					}
+					k++;
+				}
+			}
+
+			// Render cycle: Draw background guides, then paint the placed particle buffer on top with alpha blend
+			offscreenPlacementCtx.putImageData(destImgData, 0, 0);
+			drawBackgroundGuide(destCtx, W, H, cx, cy, R_max);
+			destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+
+			const endTime = performance.now();
+			const elapsed = endTime - startTime;
+
+			// Update interface statistics
+			statsPixelsPlaced.textContent = placedCount.toLocaleString();
+			statsTime.textContent = elapsed.toFixed(1) + ' ms';
+		}
+
+		// Run
+		init();
+	</script>
+<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a09bfcb3db19d794',t:'MTc4MTEzMjM3Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
+</html>

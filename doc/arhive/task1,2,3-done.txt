@@ -1,0 +1,21 @@
+
+## Task 1
+user drop image
+script internally scale it to 0.1MP
+script show circular hue HSL diagram with each image pixel placed in proper position. if >1 pixel of same color - place them near each other (without overlap) to visually represent area of same color.
+optimize speed, especially placing hot path.
+
+slider to change MAX_PIXELS 1000....100k
+if too many same pixels - automatically scale down to fit same pixels on reasonable area . so whole white image has also proper representation
+
+limit canvas size min(width, height)*0.8
+
+## Task 2
+to optimize implement:
+high-performance Opaque Buffer approach. Instead of calculating distances for every pixel (O(N²)), it uses a pre-allocated integer grid to find the nearest empty slot in O(1) average time, ensuring no overlaps while representing color density. To compare speed keep both versions and add button benchmark
+
+## Task 3
+add isometry mode.
+in this mode placement is simple: same pixels increment bar height. properly calculate position of base pixel in pseudo-3d space.
+visually it looks similar as pillars or distant skyscrapers on circular island, view from some angle above ground. 
+

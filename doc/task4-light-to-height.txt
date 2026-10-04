@@ -1,0 +1,2 @@
+add 3D draw mode:
+	same as 3D Isometric Skyscrapers but number of pixels to distance from center, light to height of skyscrapers
