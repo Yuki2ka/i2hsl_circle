@@ -501,7 +501,8 @@
 						<option value="naive">2D Swarm: O(N²) Naive Search</option>
 						<option value="isometry">3D Isometric Skyscrapers</option>
 						<option value="lighttowers">3D: Count→Radius, Light→Height</option>
-						<option value="liquid">3D: Skyscrapers → Liquid Relaxation</option>
+						<option value="sand">3D: Skyscrapers → Sand Pyramids</option>
+						<option value="liquid">3D: Skyscrapers → Immiscible Liquid</option>
 					</select>
 				</div>
 				<div class="control-group">
@@ -623,12 +624,15 @@
 		const ltDepthCurrentOffset = new Uint32Array(ISO_GRID_DIM);
 		const ltSortedTowerIndices = new Uint32Array(LT_MAX_TOWERS);
 
-		// Liquid relaxation: every drawn height unit is one real particle that
-		// keeps its exact color forever. Columns taller than a neighbor by more
+		// Particle relaxation (shared by Sand Pyramids and Immiscible Liquid):
+		// every drawn height unit is one real particle that keeps its exact
+		// color forever. Sand mode: columns taller than a neighbor by more
 		// than 1 pour their top particles into the lowest neighboring column,
-		// exactly like incompressible immiscible fluids leveling out: total
-		// volume (particle count) is conserved, colors never mix, and growing
-		// towers push neighboring pixels aside.
+		// settling into slope-1 pyramids. Liquid mode adds lateral pressure:
+		// excess particles also slide across level ground toward the nearest
+		// empty island cell, so blobs push each other aside until the whole
+		// volume rests as a single flat layer. In both modes total volume
+		// (particle count) is conserved and colors never mix.
 		const LIQ_MAX_PARTICLES = 120000; // matches the isoSortedColors safe capacity
 		const LIQ_QUEUE_CAP = 131072;     // 2^17 ring buffer, one entry per grid cell at most
 		const LIQ_QUEUE_MASK = LIQ_QUEUE_CAP - 1;
@@ -643,6 +647,8 @@
 		const liqIsland = new Uint8Array(ISO_GRID_CELLS);    // 1 inside the circular island
 		const liqQueue = new Int32Array(LIQ_QUEUE_CAP);      // unstable-column work queue (deduplicated)
 		const liqQueued = new Uint8Array(ISO_GRID_CELLS);
+		const liqDistEmpty = new Int32Array(ISO_GRID_CELLS); // BFS distance to the nearest empty island cell (liquid mode)
+		const liqBfs = new Int32Array(ISO_GRID_CELLS);       // pre-allocated BFS queue for the distance field
 		let liqParticleCount = 0;
 		let liqQueueHead = 0;
 		let liqQueueTail = 0;
@@ -650,6 +656,9 @@
 		let liqRot = 0;       // rotating neighbor scan order, keeps the flow isotropic
 		let liqAnimActive = false;
 		let liqSimTime = 0;   // cumulative relaxation compute time for the stats panel
+		let liqFlatMode = false; // false: sand pyramids (settle to ±1), true: immiscible liquid (flatten to one layer)
+		let liqMode = 'sand';    // engine selector value the running animation belongs to
+		let liqIslandCells = 0;  // number of cells inside the circular island (single-layer capacity)
 
 		// --- DOM ELEMENTS ---
 		const destCanvas = document.getElementById('hsl-canvas');
@@ -735,10 +744,13 @@
 		// rim (reachable through coordinate rounding) may hold initial liquid but
 		// can only drain onto the island, never grow.
 		function initLiquidIsland() {
+			liqIslandCells = 0;
 			for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
-				const rowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM - ISO_GRID_BOUNDS;
+				const rowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM + ISO_GRID_BOUNDS;
 				for (let gu = -ISO_GRID_BOUNDS; gu <= ISO_GRID_BOUNDS; gu++) {
-					liqIsland[rowOffset + gu] = gu * gu + gv * gv <= 180 * 180 ? 1 : 0;
+					const inside = gu * gu + gv * gv <= 180 * 180 ? 1 : 0;
+					liqIsland[rowOffset + gu] = inside;
+					liqIslandCells += inside;
 				}
 			}
 		}
@@ -769,7 +781,7 @@
 
 			engineSelector.addEventListener('change', () => {
 				const style = engineSelector.value;
-				const is3D = style === 'isometry' || style === 'lighttowers' || style === 'liquid';
+				const is3D = style === 'isometry' || style === 'lighttowers' || style === 'sand' || style === 'liquid';
 				heightScaleGroup.style.display = is3D ? 'block' : 'none';
 				heightLogGroup.style.display = is3D ? 'block' : 'none';
 				scheduleRender();
@@ -1438,21 +1450,31 @@
 				drawBackgroundGuideIsometry(destCtx, W, H, cxLT, cyLT, R_max_lt, 'max count');
 				destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
 
-			} else if (vizStyle === 'liquid') {
-				// --- 3D LIQUID RELAXATION (IMMISCIBLE) ---
+			} else if (vizStyle === 'sand' || vizStyle === 'liquid') {
+				// --- 3D PARTICLE RELAXATION: SAND PYRAMIDS / IMMISCIBLE LIQUID ---
 				// Stage 1 is identical to 3D Isometric Skyscrapers: hue -> angle,
 				// saturation -> radius, cell population -> tower height, exact
 				// colors bucketed per cell. Stage 2 (animated) treats every drawn
-				// height unit as one liquid particle: unstable columns pour their
-				// top particles into the lowest neighboring column until every
-				// neighbor pair is within ±1. Volume and per-particle colors are
-				// conserved forever, so colors flow around and over each other
-				// like immiscible liquids instead of blending.
+				// height unit as one particle. Sand mode: unstable columns pour
+				// their top particles into the lowest neighboring column until
+				// every neighbor pair is within ±1, settling into slope-1
+				// pyramids. Liquid mode: on top of that, excess particles are
+				// pushed laterally toward the nearest empty island cell, so the
+				// blobs shove each other aside and the volume ends as one flat
+				// layer — a 2D-like mosaic grown by pressure instead of spiral
+				// search. Volume and per-particle colors are conserved forever,
+				// so colors flow around and over each other without blending.
+				liqFlatMode = vizStyle === 'liquid';
+				liqMode = vizStyle;
 				const cxLiq = 300;
 				const cyLiq = 340; // Same layout as the skyscraper island
 				const R_max_liq = 180;
 				const heightLogBase = parseFloat(heightLogSlider.value);
 				const heightLogGain = 1 - Math.log(heightLogBase);
+				// Liquid mode ends as a single layer, so its particle budget is
+				// additionally capped by the island capacity: the flat sheet
+				// always fits inside the rim.
+				const liqBudget = liqFlatMode && liqIslandCells < LIQ_MAX_PARTICLES ? liqIslandCells : LIQ_MAX_PARTICLES;
 
 				// Reset the simulation state (pre-allocated, zero GC)
 				liqHead.fill(-1);
@@ -1586,8 +1608,8 @@
 					const units = Math.round(liqCellPow[i] * liqScale);
 					estTotal += units < 1 ? 1 : units;
 				}
-				if (estTotal > LIQ_MAX_PARTICLES) {
-					liqScale *= LIQ_MAX_PARTICLES / estTotal;
+				if (estTotal > liqBudget) {
+					liqScale *= liqBudget / estTotal;
 					estTotal = 0;
 					for (let i = 0; i < ISO_GRID_CELLS; i++) {
 						if (liqCellPow[i] === 0) continue;
@@ -1614,7 +1636,7 @@
 					// initial tower heights match it exactly
 					let units = Math.round(Math.pow(count, heightLogGain) * liqScale);
 					if (units < 1) units = 1;
-					if (particleIdx + units > LIQ_MAX_PARTICLES) units = LIQ_MAX_PARTICLES - particleIdx;
+					if (particleIdx + units > liqBudget) units = liqBudget - particleIdx;
 					if (units <= 0) break;
 
 					const startOffset = isoCellOffset[cellIdx];
@@ -1635,7 +1657,10 @@
 
 				// Seed the relaxation with every column that currently towers
 				// above one of its island neighbors (stable columns are never
-				// queued; they get pushed once a neighbor changes their status)
+				// queued; they get pushed once a neighbor changes their status).
+				// In liquid mode any column stacking 2+ particles is unstable
+				// by definition — the per-frame reseed keeps re-arming them
+				// until the whole volume lies flat.
 				for (let cellIdx = 0; cellIdx < ISO_GRID_CELLS; cellIdx++) {
 					const hC = liqHeight[cellIdx];
 					if (hC < 2) continue;
@@ -1659,7 +1684,7 @@
 						const hn = liqHeight[cellIdx + ISO_GRID_DIM];
 						if (hn < minH) minH = hn;
 					}
-					if (minH !== 0x7FFFFFFF && hC - minH > 1) liqPushCell(cellIdx);
+					if (minH !== 0x7FFFFFFF && (liqFlatMode || hC - minH > 1)) liqPushCell(cellIdx);
 				}
 
 				// Show the initial skyscraper state, then relax it over time
@@ -1798,15 +1823,24 @@
 			if (gv < ISO_GRID_BOUNDS) liqPushCell(cellIdx + ISO_GRID_DIM);
 		}
 
-		// Process unstable columns off the work queue. A column pours only into
-		// its lowest island neighbor and only while the height difference exceeds
-		// 1, so the potential sum(h^2) strictly decreases with every moved
-		// particle: the relaxation provably terminates with every neighboring
-		// column pair within ±1 of each other and a fully drained queue. Flat
-		// puddles form where the liquid is thin; where volume concentrates it
-		// settles into gentle slope-1 mounds, like viscous immiscible droplets.
+		// Process unstable columns off the work queue. Gravity rule (both
+		// modes): a column pours only into its lowest island neighbor and only
+		// while the height difference exceeds 1, so the potential sum(h^2)
+		// strictly decreases with every moved particle — sand mode provably
+		// terminates with every neighboring pair within ±1, i.e. slope-1
+		// pyramids. Pressure rule (liquid mode only): when gravity is already
+		// balanced but the column still stacks 2+ particles, its top particle
+		// slides onto the lower neighbor that is strictly closer to the nearest
+		// empty island cell (liqDistEmpty BFS field). The excess travels as a
+		// visible bump across occupied territory and settles in free ground, so
+		// colliding blobs push each other aside until the whole volume rests as
+		// one flat layer. Distance strictly decreases along every slide, so each
+		// bump provably reaches an empty cell while the field is fresh; the
+		// animation tick refreshes the field every frame as empties get claimed.
+		// Returns the number of particles actually moved.
 		function liqStep(maxEvents) {
 			let events = 0;
+			let moved = 0;
 			const t0 = performance.now();
 			while (liqQueueCount > 0 && events < maxEvents) {
 				if ((events & 127) === 0 && performance.now() - t0 > 8) break;
@@ -1848,7 +1882,56 @@
 				}
 				if (bestN === -1) continue;
 				const diff = hC - bestH;
-				if (diff <= 1) continue;
+				if (diff <= 1) {
+					if (!liqFlatMode) continue;
+
+					// Pressure rule: gravity is balanced but the column still
+					// stacks 2+ particles. Slide the top particle onto a lower
+					// neighbor strictly closer to the nearest empty island cell.
+					let slideN = -1;
+					let slideD = liqDistEmpty[cell];
+					for (let k = 0; k < 4; k++) {
+						const dir = (liqRot + k) & 3;
+						let n = -1;
+						if (dir === 0) {
+							if (gu > -ISO_GRID_BOUNDS) n = cell - 1;
+						} else if (dir === 1) {
+							if (gu < ISO_GRID_BOUNDS) n = cell + 1;
+						} else if (dir === 2) {
+							if (gv > -ISO_GRID_BOUNDS) n = cell - ISO_GRID_DIM;
+						} else if (gv < ISO_GRID_BOUNDS) {
+							n = cell + ISO_GRID_DIM;
+						}
+						if (n === -1 || liqIsland[n] === 0) continue;
+						if (liqHeight[n] >= hC) continue; // never climb: keeps heights bounded
+						const dn = liqDistEmpty[n];
+						if (dn < slideD) {
+							slideD = dn;
+							slideN = n;
+						}
+					}
+					if (slideN === -1) continue;
+
+					const p = liqTail[cell];
+					const below = liqPrev[p];
+					liqTail[cell] = below;
+					if (below === -1) liqHead[cell] = -1;
+					else liqNext[below] = -1;
+					liqHeight[cell]--;
+
+					const top = liqTail[slideN];
+					liqPrev[p] = top;
+					if (top === -1) liqHead[slideN] = p;
+					else liqNext[top] = p;
+					liqTail[slideN] = p;
+					liqNext[p] = -1;
+					liqHeight[slideN]++;
+					moved++;
+
+					liqPushNeighborhood(cell);
+					liqPushNeighborhood(slideN);
+					continue;
+				}
 
 				// Pour the top particles onto the lowest neighbor. Late arrivals
 				// rest on top, so an overtopped column later sheds the visitor's
@@ -1875,11 +1958,61 @@
 					liqNext[p] = -1;
 					liqHeight[bestN]++;
 					moves--;
+					moved++;
 				}
 				liqPushNeighborhood(cell);
 				liqPushNeighborhood(bestN);
 			}
-			return events;
+			return moved;
+		}
+
+		// --- IMMISCIBLE LIQUID PRESSURE FIELD (LIQUID MODE ONLY) ---
+		// Multi-source BFS from every empty island cell: liqDistEmpty becomes
+		// the hop distance to the nearest free ground. Off-island cells keep an
+		// "infinite" distance, so rim overflow always drains inward and bumps
+		// never leave the island. Pre-allocated queue, zero allocations.
+		function liqRecomputeDistEmpty() {
+			liqDistEmpty.fill(0x3FFFFFFF);
+			let head = 0;
+			let tail = 0;
+			for (let i = 0; i < ISO_GRID_CELLS; i++) {
+				if (liqIsland[i] === 1 && liqHeight[i] === 0) {
+					liqDistEmpty[i] = 0;
+					liqBfs[tail++] = i;
+				}
+			}
+			while (head < tail) {
+				const c = liqBfs[head++];
+				const d = liqDistEmpty[c] + 1;
+				const gu = (c % ISO_GRID_DIM) - ISO_GRID_BOUNDS;
+				const gv = ((c / ISO_GRID_DIM) | 0) - ISO_GRID_BOUNDS;
+				if (gu > -ISO_GRID_BOUNDS && liqIsland[c - 1] === 1 && liqDistEmpty[c - 1] > d) {
+					liqDistEmpty[c - 1] = d;
+					liqBfs[tail++] = c - 1;
+				}
+				if (gu < ISO_GRID_BOUNDS && liqIsland[c + 1] === 1 && liqDistEmpty[c + 1] > d) {
+					liqDistEmpty[c + 1] = d;
+					liqBfs[tail++] = c + 1;
+				}
+				if (gv > -ISO_GRID_BOUNDS && liqIsland[c - ISO_GRID_DIM] === 1 && liqDistEmpty[c - ISO_GRID_DIM] > d) {
+					liqDistEmpty[c - ISO_GRID_DIM] = d;
+					liqBfs[tail++] = c - ISO_GRID_DIM;
+				}
+				if (gv < ISO_GRID_BOUNDS && liqIsland[c + ISO_GRID_DIM] === 1 && liqDistEmpty[c + ISO_GRID_DIM] > d) {
+					liqDistEmpty[c + ISO_GRID_DIM] = d;
+					liqBfs[tail++] = c + ISO_GRID_DIM;
+				}
+			}
+		}
+
+		// Re-arm every column still stacking 2+ particles. The distance field
+		// goes stale as empties get claimed, so stalled bumps are revived here
+		// each frame right after the field refresh; queue dedup keeps this
+		// idempotent and allocation-free.
+		function liqReseedFlat() {
+			for (let i = 0; i < ISO_GRID_CELLS; i++) {
+				if (liqHeight[i] > 1) liqPushCell(i);
+			}
 		}
 
 		// Paint the liquid height field back-to-front (painter's depth occlusion),
@@ -1927,7 +2060,19 @@
 		}
 
 		function liqAnimationTick() {
-			if (engineSelector.value !== 'liquid' || liqQueueCount === 0) {
+			if (engineSelector.value !== liqMode) {
+				liqAnimActive = false;
+				return;
+			}
+
+			const t0 = performance.now();
+			if (liqFlatMode) {
+				// Refresh the pressure field (empties claimed last frame rerou-
+				// te the remaining excess) and revive every stalled bump.
+				liqRecomputeDistEmpty();
+				liqReseedFlat();
+			}
+			if (liqQueueCount === 0) {
 				liqAnimActive = false;
 				return;
 			}
@@ -1941,13 +2086,16 @@
 			if (maxEvents < 150) maxEvents = 150;
 			else if (maxEvents > 8000) maxEvents = 8000;
 
-			const t0 = performance.now();
-			liqStep(maxEvents);
+			const moved = liqStep(maxEvents);
 			liqSimTime += performance.now() - t0;
 			drawLiquidFrame(300, 340);
 			statsTime.textContent = liqSimTime.toFixed(1) + ' ms';
 
-			if (liqQueueCount > 0) requestAnimationFrame(liqAnimationTick);
+			// Run until a fixpoint: nothing moved AND the queue fully drained.
+			// In liquid mode a handful of rim columns outside the island can
+			// stay stacked forever; the drained-with-zero-moves test lets the
+			// loop retire instead of reseeding them endlessly.
+			if (liqQueueCount > 0 || moved > 0) requestAnimationFrame(liqAnimationTick);
 			else liqAnimActive = false;
 		}
 

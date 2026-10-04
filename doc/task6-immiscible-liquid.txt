@@ -1,0 +1,2 @@
+rename previous "liquid relaxation" mode to Sand Pyramids: it settles into slope-1 piles, that is sand, not liquid.
+add new 3D mode Immiscible Liquid: same particle start as skyscrapers, but columns push each other laterally until the whole volume rests flat as a single layer. result is similar to 2D mode but grown by pressure and displacement, which gives more interesting shapes.
