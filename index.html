@@ -110,6 +110,27 @@
 			height: 100%;
 		}
 
+		#canvas-container.canvas-orbit {
+			touch-action: none;
+			cursor: grab;
+		}
+
+		#canvas-container.canvas-orbit:active {
+			cursor: grabbing;
+		}
+
+		#camera-hint {
+			position: absolute;
+			left: 10px;
+			bottom: 8px;
+			font-size: 11px;
+			color: rgba(255, 255, 255, 0.45);
+			pointer-events: none;
+			display: none;
+			z-index: 5;
+			white-space: nowrap;
+		}
+
 		#drop-overlay {
 			position: absolute;
 			top: 0;
@@ -454,6 +475,7 @@
 		<div class="canvas-card">
 			<div id="canvas-container">
 				<canvas id="hsl-canvas" width="600" height="600"></canvas>
+				<div id="camera-hint">drag — orbit · wheel / pinch — zoom · double-click — reset view</div>
 				<div id="drop-overlay">
 					<div class="overlay-content">
 						<div class="overlay-title">Drop Image Here</div>
@@ -719,11 +741,42 @@
 		let prSolveSweep = 0;
 		let prRot = 0;            // rotating hop order, keeps the flow isotropic
 
+		// --- 3D ORBIT CAMERA & INSTANCED WEBGL2 RENDERER (ALL 3D MODES) ---
+		// Rotating and zooming the island re-projects every drawn height unit
+		// every frame, and a free camera angle makes the fixed back-to-front
+		// painter order worthless: correct occlusion needs a per-pixel depth
+		// test. At the mode budgets (up to 120k boxes) that is millions of
+		// depth-tested pixel writes per frame — far beyond interactive plain
+		// JS — but a single instanced draw call on the GPU. So the camera only
+		// exists on the WebGL2 path; without it the 3D modes keep the classic
+		// fixed-view JS painter exactly as before.
+		const ISO3D_MAX_INSTANCES = 120000; // matches the particle budget of the sand/liquid modes
+		const ISO3D_INSTANCE_FLOATS = 5;    // x, y, z, height (floats) + rgba (uint32), interleaved
+		const ISO3D_ROT_SPEED = Math.PI * 2 / 600; // one full canvas-width drag = one full orbit
+		const ISO3D_ZOOM_WHEEL = 0.0016;    // wheel delta -> logarithmic zoom factor
+		const ISO3D_MIN_PITCH = 0.10;       // radians above the horizon
+		const ISO3D_MAX_PITCH = 1.52;       // almost top-down
+		const ISO3D_MIN_SCALE = 0.5;
+		const ISO3D_MAX_SCALE = 16.0;
+		const ISO3D_PAN_PX = 40;            // floor centre rests this far below the canvas centre, like cy = 340
+		const ISO3D_DEFAULT_PITCH = Math.PI / 6; // 30 deg, nearest proper rotation to the 0.5 squash
+		const iso3dInstanceBuf = new ArrayBuffer(ISO3D_MAX_INSTANCES * ISO3D_INSTANCE_FLOATS * 4);
+		const iso3dInstF32 = new Float32Array(iso3dInstanceBuf);
+		const iso3dInstU32 = new Uint32Array(iso3dInstanceBuf);
+		let iso3dInstanceCount = 0;
+		let iso3dMaxTop = 0;                // tallest box top, sizes the depth range
+		let iso3dAz = 0;                    // azimuth: 0 = the classic front view
+		let iso3dPitch = ISO3D_DEFAULT_PITCH;
+		let iso3dScale = 1;                 // pixels per grid unit
+		let iso3dRadialLabel = 'S';         // ring label of the current mode ('S' or 'max count')
+		let iso3dFramePending = false;
+
 		// --- DOM ELEMENTS ---
 		const destCanvas = document.getElementById('hsl-canvas');
 		const destCtx = destCanvas.getContext('2d', { alpha: false, desynchronized: true });
 		
 		const canvasContainer = document.getElementById('canvas-container');
+		const cameraHint = document.getElementById('camera-hint');
 		const fileInput = document.getElementById('file-input');
 		const btnSelect = document.getElementById('btn-select');
 		
@@ -775,6 +828,7 @@
 		function init() {
 			initSpiral();
 			initLiquidIsland();
+			iso3dSupported(); // probe once so the camera affordances know their fate
 			prHideIfUnsupported();
 			setupEventListeners();
 			loadPreset('wheel');
@@ -850,8 +904,7 @@
 			});
 
 			engineSelector.addEventListener('change', () => {
-				const style = engineSelector.value;
-				const is3D = style === 'isometry' || style === 'lighttowers' || style === 'sand' || style === 'liquid';
+				const is3D = iso3dModeActive(engineSelector.value);
 				heightScaleGroup.style.display = is3D ? 'block' : 'none';
 				heightLogGroup.style.display = is3D ? 'block' : 'none';
 				scheduleRender();
@@ -886,6 +939,74 @@
 				btn.addEventListener('click', (e) => {
 					loadPreset(e.target.dataset.preset);
 				});
+			});
+
+			// 3D orbit camera: one pointer drags (azimuth + pitch), two
+			// pointers pinch-zoom, the wheel zooms, double-click resets.
+			// The handlers self-disable outside the WebGL 3D modes.
+			const iso3dPointers = new Map();
+			let iso3dPinchDist = 0;
+
+			const iso3dPointerDistance = () => {
+				const it = iso3dPointers.values();
+				const a = it.next().value;
+				const b = it.next().value;
+				const dx = a.x - b.x;
+				const dy = a.y - b.y;
+				return Math.sqrt(dx * dx + dy * dy);
+			};
+
+			canvasContainer.addEventListener('pointerdown', (e) => {
+				if (!iso3dModeActive(engineSelector.value) || !iso3dGpuReady()) return;
+				if (canvasContainer.setPointerCapture) {
+					try { canvasContainer.setPointerCapture(e.pointerId); } catch (err) {}
+				}
+				iso3dPointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+				if (iso3dPointers.size === 2) iso3dPinchDist = iso3dPointerDistance();
+			});
+
+			canvasContainer.addEventListener('pointermove', (e) => {
+				const pt = iso3dPointers.get(e.pointerId);
+				if (!pt) return;
+				const dx = e.clientX - pt.x;
+				const dy = e.clientY - pt.y;
+				pt.x = e.clientX;
+				pt.y = e.clientY;
+				if (iso3dPointers.size === 1) {
+					// Grab-the-scene feel: the island follows the cursor, and
+					// dragging down tips the top of the towers into view.
+					iso3dAz -= dx * ISO3D_ROT_SPEED;
+					iso3dPitch += dy * ISO3D_ROT_SPEED;
+					if (iso3dPitch < ISO3D_MIN_PITCH) iso3dPitch = ISO3D_MIN_PITCH;
+					else if (iso3dPitch > ISO3D_MAX_PITCH) iso3dPitch = ISO3D_MAX_PITCH;
+					iso3dScheduleFrame();
+				} else if (iso3dPointers.size === 2) {
+					const d = iso3dPointerDistance();
+					if (iso3dPinchDist > 0 && d > 0) iso3dZoom(d / iso3dPinchDist);
+					iso3dPinchDist = d;
+				}
+			});
+
+			const iso3dPointerEnd = (e) => {
+				iso3dPointers.delete(e.pointerId);
+				if (iso3dPointers.size < 2) iso3dPinchDist = 0;
+			};
+			canvasContainer.addEventListener('pointerup', iso3dPointerEnd);
+			canvasContainer.addEventListener('pointercancel', iso3dPointerEnd);
+
+			canvasContainer.addEventListener('wheel', (e) => {
+				if (!iso3dModeActive(engineSelector.value) || !iso3dGpuReady()) return;
+				e.preventDefault();
+				const dy = e.deltaMode === 1 ? e.deltaY * 33 : e.deltaY; // lines -> pixels
+				iso3dZoom(Math.exp(-dy * ISO3D_ZOOM_WHEEL));
+			}, { passive: false });
+
+			canvasContainer.addEventListener('dblclick', () => {
+				if (!iso3dModeActive(engineSelector.value) || !iso3dGpuReady()) return;
+				iso3dAz = 0;
+				iso3dPitch = ISO3D_DEFAULT_PITCH;
+				iso3dScale = 1;
+				iso3dScheduleFrame();
 			});
 
 			// Benchmark
@@ -1178,6 +1299,93 @@
 			}
 		}
 
+		// --- PAINTER FALLBACK: FIXED-VIEW SKYSCRAPERS (NO WEBGL2) ---
+		// The classic renderer: row-by-row back-to-front painter's depth
+		// occlusion on the squashed grid. Returns the number of placed pixels.
+		function isoPaintSkyscrapers(cx, cy, rMax, heightScale, heightLogGain) {
+			let placed = 0;
+			for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
+				const gridRowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM;
+				const baseSY = cy + gv * 0.5; // Tilted aspect: squish Y coordinate by 0.5
+
+				for (let gu = -ISO_GRID_BOUNDS; gu <= ISO_GRID_BOUNDS; gu++) {
+					const gridIdx = gridRowOffset + (gu + ISO_GRID_BOUNDS);
+					const count = isoCellCount[gridIdx];
+					if (count === 0) continue;
+
+					const startOffset = isoCellOffset[gridIdx];
+					const baseSX = cx + gu;
+
+					// Draw a solid pillar. The log base rescales the logarithm of the
+					// height: base 1 stays linear, above 1 shrinks, below 1 expands.
+					const displayHeight = Math.max(1, Math.round(Math.pow(count, heightLogGain) * heightScale));
+
+					for (let z = 0; z < displayHeight; z++) {
+						const colorIndex = Math.min(count - 1, Math.floor((z + 0.5) * count / displayHeight));
+						const color = isoSortedColors[startOffset + colorIndex];
+						const sy = Math.round(baseSY - z);
+
+						if (sy >= 0 && sy < H && baseSX >= 1 && baseSX < W - 1) {
+							const gIdx = sy * W + baseSX;
+							// Draw 3px wide pillars for robust structural visibility
+							grid[gIdx - 1] = color;
+							grid[gIdx] = color;
+							grid[gIdx + 1] = color;
+						}
+					}
+					placed += count;
+				}
+			}
+
+			offscreenPlacementCtx.putImageData(destImgData, 0, 0);
+			drawBackgroundGuideIsometry(destCtx, W, H, cx, cy, rMax);
+			destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+			return placed;
+		}
+
+		// --- PAINTER FALLBACK: FIXED-VIEW LIGHT TOWERS (NO WEBGL2) ---
+		// Counting-sort towers by floor depth, then paint back to front.
+		function ltPaintTowers(cx, cy, rMax, towerCount, heightScale, heightLogGain) {
+			let depthSum = 0;
+			for (let i = 0; i < ISO_GRID_DIM; i++) {
+				ltDepthOffset[i] = depthSum;
+				ltDepthCurrentOffset[i] = depthSum;
+				depthSum += ltDepthCount[i];
+			}
+			for (let i = 0; i < towerCount; i++) {
+				const depthIdx = ltTowerY[i] + ISO_GRID_BOUNDS;
+				ltSortedTowerIndices[ltDepthCurrentOffset[depthIdx]++] = i;
+			}
+
+			for (let depthIdx = 0; depthIdx < ISO_GRID_DIM; depthIdx++) {
+				const end = ltDepthOffset[depthIdx] + ltDepthCount[depthIdx];
+				for (let sortedIdx = ltDepthOffset[depthIdx]; sortedIdx < end; sortedIdx++) {
+					const towerIdx = ltSortedTowerIndices[sortedIdx];
+					const baseSX = cx + ltTowerX[towerIdx];
+					const baseSY = cy + ltTowerY[towerIdx] * 0.5;
+					const rawHeight = ltTowerHeight[towerIdx];
+					const displayHeight = Math.max(1, Math.round(Math.pow(rawHeight, heightLogGain) * heightScale));
+					const color = ltTowerColor[towerIdx];
+
+					for (let z = 0; z < displayHeight; z++) {
+						const sy = Math.round(baseSY - z);
+						if (sy >= 0 && sy < H && baseSX >= 1 && baseSX < W - 1) {
+							const gIdx = sy * W + baseSX;
+							grid[gIdx - 1] = color;
+							grid[gIdx] = color;
+							grid[gIdx + 1] = color;
+						}
+					}
+				}
+			}
+
+			// Render out the light towers view. Radius labels represent each
+			// color's count as a percentage of the largest color population.
+			offscreenPlacementCtx.putImageData(destImgData, 0, 0);
+			drawBackgroundGuideIsometry(destCtx, W, H, cx, cy, rMax, 'max count');
+			destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+		}
+
 		// --- ANIMATION FRAME THROTTLE ---
 		let isRenderScheduled = false;
 		function scheduleRender() {
@@ -1192,6 +1400,8 @@
 		// --- MAIN HIGH-PERFORMANCE PLACEMENT ENGINE ---
 		function render() {
 			if (!currentImage) return;
+
+			iso3dUpdateInteractive(); // camera affordances follow the active mode
 
 			const startTime = performance.now();
 			const maxPixels = parseInt(maxPixelsSlider.value, 10);
@@ -1345,44 +1555,12 @@
 					isoSortedColors[writeIdx] = 0xFF000000 | (b << 16) | (g << 8) | r;
 				}
 
-				// Pass 3: Draw skyscrapers row-by-row from back to front (O(N) painter's depth occlusion)
-				for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
-					const gridRowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM;
-					const baseSY = cyIso + gv * 0.5; // Tilted aspect: squish Y coordinate by 0.5
-
-					for (let gu = -ISO_GRID_BOUNDS; gu <= ISO_GRID_BOUNDS; gu++) {
-						const gridIdx = gridRowOffset + (gu + ISO_GRID_BOUNDS);
-						const count = isoCellCount[gridIdx];
-						if (count === 0) continue;
-
-						const startOffset = isoCellOffset[gridIdx];
-						const baseSX = cxIso + gu;
-
-// Draw a solid pillar. The log base rescales the logarithm of the
-					// height: base 1 stays linear, above 1 shrinks, below 1 expands.
-						const displayHeight = Math.max(1, Math.round(Math.pow(count, heightLogGain) * heightScale));
-
-						for (let z = 0; z < displayHeight; z++) {
-							const colorIndex = Math.min(count - 1, Math.floor((z + 0.5) * count / displayHeight));
-							const color = isoSortedColors[startOffset + colorIndex];
-							const sy = Math.round(baseSY - z);
-
-							if (sy >= 0 && sy < H && baseSX >= 1 && baseSX < W - 1) {
-								const gIdx = sy * W + baseSX;
-								// Draw 3px wide pillars for robust structural visibility
-								grid[gIdx - 1] = color;
-								grid[gIdx] = color;
-								grid[gIdx + 1] = color;
-							}
-						}
-						placedCount += count;
-					}
-				}
-
-				// Render out the isometric view
-				offscreenPlacementCtx.putImageData(destImgData, 0, 0);
-				drawBackgroundGuideIsometry(destCtx, W, H, cxIso, cyIso, R_max_iso);
-				destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+				// Pass 3: Draw the skyscrapers. The WebGL2 path renders the
+				// identical towers as instanced boxes under the orbit camera;
+				// the fixed-view painter is the no-WebGL fallback.
+				const placed3d = iso3dRenderSkyscrapers(heightScale, heightLogGain);
+				if (placed3d < 0) placedCount += isoPaintSkyscrapers(cxIso, cyIso, R_max_iso, heightScale, heightLogGain);
+				else placedCount += placed3d;
 
 			} else if (vizStyle === 'lighttowers') {
 				// --- 3D LIGHT TOWERS: COUNT -> RADIUS, HUE -> ANGLE, LIGHT -> HEIGHT ---
@@ -1480,45 +1658,11 @@
 					heightScale = syncHeightScaleSlider(TOWER_AUTOSCALE_MAX / Math.pow(maxTowerRaw, heightLogGain));
 				}
 
-				// Counting-sort towers by floor depth for back-to-front occlusion.
-				let depthSum = 0;
-				for (let i = 0; i < ISO_GRID_DIM; i++) {
-					ltDepthOffset[i] = depthSum;
-					ltDepthCurrentOffset[i] = depthSum;
-					depthSum += ltDepthCount[i];
+				// Draw the towers: instanced WebGL2 boxes under the orbit
+				// camera, or the fixed-view counting-sort painter fallback.
+				if (!iso3dRenderLightTowers(towerCount, heightScale, heightLogGain)) {
+					ltPaintTowers(cxLT, cyLT, R_max_lt, towerCount, heightScale, heightLogGain);
 				}
-				for (let i = 0; i < towerCount; i++) {
-					const depthIdx = ltTowerY[i] + ISO_GRID_BOUNDS;
-					ltSortedTowerIndices[ltDepthCurrentOffset[depthIdx]++] = i;
-				}
-
-				for (let depthIdx = 0; depthIdx < ISO_GRID_DIM; depthIdx++) {
-					const end = ltDepthOffset[depthIdx] + ltDepthCount[depthIdx];
-					for (let sortedIdx = ltDepthOffset[depthIdx]; sortedIdx < end; sortedIdx++) {
-						const towerIdx = ltSortedTowerIndices[sortedIdx];
-						const baseSX = cxLT + ltTowerX[towerIdx];
-						const baseSY = cyLT + ltTowerY[towerIdx] * 0.5;
-						const rawHeight = ltTowerHeight[towerIdx];
-						const displayHeight = Math.max(1, Math.round(Math.pow(rawHeight, heightLogGain) * heightScale));
-						const color = ltTowerColor[towerIdx];
-
-						for (let z = 0; z < displayHeight; z++) {
-							const sy = Math.round(baseSY - z);
-							if (sy >= 0 && sy < H && baseSX >= 1 && baseSX < W - 1) {
-								const gIdx = sy * W + baseSX;
-								grid[gIdx - 1] = color;
-								grid[gIdx] = color;
-								grid[gIdx + 1] = color;
-							}
-						}
-					}
-				}
-
-				// Render out the light towers view. Radius labels represent each
-				// color's count as a percentage of the largest color population.
-				offscreenPlacementCtx.putImageData(destImgData, 0, 0);
-				drawBackgroundGuideIsometry(destCtx, W, H, cxLT, cyLT, R_max_lt, 'max count');
-				destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
 
 			} else if (vizStyle === 'sand' || vizStyle === 'liquid') {
 				// --- 3D PARTICLE RELAXATION: SAND PYRAMIDS / IMMISCIBLE LIQUID ---
@@ -2097,7 +2241,9 @@
 
 		// Paint the liquid height field back-to-front (painter's depth occlusion),
 		// one 3px pillar slice per particle. Column walks stay allocation-free.
+		// The WebGL2 orbit renderer takes over when available.
 		function drawLiquidFrame(cx, cy) {
+			if (iso3dRenderLiquid()) return;
 			grid.fill(0);
 			for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
 				const rowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM;
@@ -2177,6 +2323,501 @@
 			// loop retire instead of reseeding them endlessly.
 			if (liqQueueCount > 0 || moved > 0) requestAnimationFrame(liqAnimationTick);
 			else liqAnimActive = false;
+		}
+
+		// --- 3D ORBIT RENDERER: WEBGL2 INSTANCED BOXES -----------------------
+		// Camera model: orthographic orbit around the island centre. World
+		// axes are (u, v) on the floor and z up; the view rotates the floor by
+		// the azimuth, tilts by the pitch and scales by the zoom, so the
+		// default (azimuth 0, pitch 30) matches the classic squashed view.
+
+		// One shared unit cube, instanced per height run. The view is a pure
+		// orthographic orbit: rotate by the azimuth, tilt by the pitch, scale
+		// by the zoom. w = (u, v, z up).
+		const ISO3D_VS_BOX = `#version 300 es
+layout(location = 0) in vec3 aCorner;
+layout(location = 1) in float aShade;
+layout(location = 2) in vec3 aOffset;
+layout(location = 3) in float aHeight;
+layout(location = 4) in vec4 aColor;
+uniform vec4 uView;   // cos(az), sin(az), sin(pitch), cos(pitch)
+uniform vec3 uScreen; // scale, pan px, depth scale
+out vec4 vColor;
+void main() {
+	vec3 w = aOffset + aCorner * vec3(1.0, 1.0, aHeight);
+	float right = w.x * uView.x - w.y * uView.y;
+	float toward = w.x * uView.y + w.y * uView.x;
+	float up = toward * -uView.z + w.z * uView.w;
+	float depth = toward * uView.w + w.z * uView.z;
+	gl_Position = vec4(right * uScreen.x / 300.0, (up * uScreen.x - uScreen.y) / 300.0, -depth * uScreen.z, 1.0);
+	vColor = vec4(aColor.rgb * aShade, aColor.a);
+}`;
+
+		const ISO3D_FS_SOLID = `#version 300 es
+precision mediump float;
+in vec4 vColor;
+out vec4 oColor;
+void main() { oColor = vColor; }`;
+
+		// Floor guide (island disc, saturation rings, hue spokes) shares the
+		// exact view of the box shader so it always stays glued to the island.
+		const ISO3D_VS_FLAT = `#version 300 es
+layout(location = 0) in vec3 aPos;
+uniform vec4 uView;
+uniform vec3 uScreen;
+uniform vec4 uColor;
+out vec4 vColor;
+void main() {
+	float right = aPos.x * uView.x - aPos.y * uView.y;
+	float toward = aPos.x * uView.y + aPos.y * uView.x;
+	float up = toward * -uView.z + aPos.z * uView.w;
+	float depth = toward * uView.w + aPos.z * uView.z;
+	gl_Position = vec4(right * uScreen.x / 300.0, (up * uScreen.x - uScreen.y) / 300.0, -depth * uScreen.z, 1.0);
+	vColor = uColor;
+}`;
+
+		let iso3dChecked = false;
+		let iso3dOk = false;
+		let iso3dBroken = false;
+		let iso3dInited = false;
+		let iso3dGl = null;
+		let iso3dCanvas = null;
+		let iso3dBoxProg = null;
+		let iso3dFlatProg = null;
+		let iso3dBoxVao = null;
+		let iso3dFloorVao = null;
+		let iso3dInstGlBuf = null;
+
+		function iso3dModeActive(style) {
+			return style === 'isometry' || style === 'lighttowers' || style === 'sand' || style === 'liquid';
+		}
+
+		// Cheap one-time capability probe (plain WebGL2 — no float targets
+		// needed here). Without it the 3D modes simply stay on the JS painter.
+		function iso3dSupported() {
+			if (iso3dChecked) return iso3dOk;
+			iso3dChecked = true;
+			try {
+				const probe = document.createElement('canvas');
+				probe.width = 1;
+				probe.height = 1;
+				const gl = probe.getContext('webgl2', { alpha: false, depth: false, stencil: false, antialias: false });
+				if (gl) iso3dOk = true;
+				const lose = gl ? gl.getExtension('WEBGL_lose_context') : null;
+				if (lose) lose.loseContext();
+			} catch (e) {
+				iso3dOk = false;
+			}
+			return iso3dOk;
+		}
+
+		function iso3dCompile(gl, type, source) {
+			const sh = gl.createShader(type);
+			gl.shaderSource(sh, source);
+			gl.compileShader(sh);
+			if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+				gl.deleteShader(sh);
+				return null;
+			}
+			return sh;
+		}
+
+		function iso3dLink(gl, vsSrc, fsSrc) {
+			const vs = iso3dCompile(gl, gl.VERTEX_SHADER, vsSrc);
+			const fs = iso3dCompile(gl, gl.FRAGMENT_SHADER, fsSrc);
+			if (!vs || !fs) return null;
+			const prog = gl.createProgram();
+			gl.attachShader(prog, vs);
+			gl.attachShader(prog, fs);
+			gl.linkProgram(prog);
+			gl.deleteShader(vs);
+			gl.deleteShader(fs);
+			if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+				gl.deleteProgram(prog);
+				return null;
+			}
+			return {
+				prog,
+				uView: gl.getUniformLocation(prog, 'uView'),
+				uScreen: gl.getUniformLocation(prog, 'uScreen'),
+				uColor: gl.getUniformLocation(prog, 'uColor')
+			};
+		}
+
+		// 6 faces x 4 corners of the shared unit cube: corner coordinates
+		// (0/1 per axis) plus a fixed per-face shade. Tangents are chosen so
+		// t1 x t2 = the face normal, i.e. every quad winds counter-clockwise
+		// around its outward normal (the projection mirrors it to clockwise
+		// on screen — see the frontFace call in iso3dInit). The shade fakes
+		// one warm key light so box edges stay readable at any zoom.
+		function iso3dCubeGeometry() {
+			const verts = new Float32Array(24 * 4);
+			const idx = new Uint16Array(36);
+			const faces = [[0, 1, 0.74], [0, -1, 0.64], [1, 1, 0.88], [1, -1, 0.58], [2, 1, 1.0], [2, -1, 0.5]];
+			let vi = 0;
+			for (let f = 0; f < 6; f++) {
+				const axis = faces[f][0];
+				const sign = faces[f][1];
+				const t1 = sign > 0 ? (axis + 1) % 3 : (axis + 2) % 3;
+				const t2 = sign > 0 ? (axis + 2) % 3 : (axis + 1) % 3;
+				const base = f * 4;
+			for (let c = 0; c < 4; c++) {
+				const b1 = (c === 1 || c === 2) ? 1 : 0;
+				const b2 = c >= 2 ? 1 : 0;
+				verts[vi++] = axis === 0 ? (sign > 0 ? 1 : 0) : (t1 === 0 ? b1 : b2);
+				verts[vi++] = axis === 1 ? (sign > 0 ? 1 : 0) : (t1 === 1 ? b1 : b2);
+				verts[vi++] = axis === 2 ? (sign > 0 ? 1 : 0) : (t1 === 2 ? b1 : b2);
+				verts[vi++] = faces[f][2];
+			}
+				idx[f * 6] = base;
+				idx[f * 6 + 1] = base + 1;
+				idx[f * 6 + 2] = base + 2;
+				idx[f * 6 + 3] = base;
+				idx[f * 6 + 4] = base + 2;
+				idx[f * 6 + 5] = base + 3;
+			}
+			return { verts, idx };
+		}
+
+		// Island disc fan + 4 saturation rings + 12 hue spokes, all on the
+		// z = 0 floor. Drawn first without depth writes, so the boxes simply
+		// paint over it wherever they stand.
+		function iso3dFloorGeometry() {
+			const SEG = 128;
+			const rings = [45, 90, 135, 180];
+			const pos = new Float32Array((1 + SEG + rings.length * SEG + 24) * 3);
+			let o = 0;
+			pos[o++] = 0; pos[o++] = 0; pos[o++] = 0;
+			for (let s = 0; s < SEG; s++) {
+				const a = s / SEG * Math.PI * 2;
+				pos[o++] = Math.cos(a) * 180.5;
+				pos[o++] = Math.sin(a) * 180.5;
+				pos[o++] = 0;
+			}
+			for (let r = 0; r < rings.length; r++) {
+				for (let s = 0; s < SEG; s++) {
+					const a = s / SEG * Math.PI * 2;
+					pos[o++] = Math.cos(a) * rings[r];
+					pos[o++] = Math.sin(a) * rings[r];
+					pos[o++] = 0;
+				}
+			}
+			for (let deg = 0; deg < 360; deg += 30) {
+				const a = deg * Math.PI / 180;
+				pos[o++] = 0; pos[o++] = 0; pos[o++] = 0;
+				pos[o++] = Math.cos(a) * 180;
+				pos[o++] = Math.sin(a) * 180;
+				pos[o++] = 0;
+			}
+			return pos;
+		}
+
+		function iso3dInit() {
+			iso3dInited = true;
+			try {
+				iso3dCanvas = document.createElement('canvas');
+				iso3dCanvas.width = W;
+				iso3dCanvas.height = H;
+				// The frame is composited through the visible 2D canvas, so the
+				// drawing buffer must survive until that drawImage happens.
+				iso3dGl = iso3dCanvas.getContext('webgl2', { alpha: false, depth: true, stencil: false, antialias: true, preserveDrawingBuffer: true });
+				if (!iso3dGl) throw new Error('no webgl2');
+				const gl = iso3dGl;
+				iso3dCanvas.addEventListener('webglcontextlost', (e) => {
+					e.preventDefault();
+					iso3dBroken = true;
+					iso3dUpdateInteractive();
+					scheduleRender(); // repaint immediately on the JS painter
+				});
+
+				iso3dBoxProg = iso3dLink(gl, ISO3D_VS_BOX, ISO3D_FS_SOLID);
+				iso3dFlatProg = iso3dLink(gl, ISO3D_VS_FLAT, ISO3D_FS_SOLID);
+				if (!iso3dBoxProg || !iso3dFlatProg) throw new Error('shader build failed');
+
+				// Unit cube + per-instance height runs (x, y, z, height, rgba)
+				iso3dBoxVao = gl.createVertexArray();
+				gl.bindVertexArray(iso3dBoxVao);
+				const cube = iso3dCubeGeometry();
+				gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+				gl.bufferData(gl.ARRAY_BUFFER, cube.verts, gl.STATIC_DRAW);
+				gl.enableVertexAttribArray(0);
+				gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 16, 0);
+				gl.enableVertexAttribArray(1);
+				gl.vertexAttribPointer(1, 1, gl.FLOAT, false, 16, 12);
+				gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, gl.createBuffer());
+				gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, cube.idx, gl.STATIC_DRAW);
+				iso3dInstGlBuf = gl.createBuffer();
+				gl.bindBuffer(gl.ARRAY_BUFFER, iso3dInstGlBuf);
+				gl.bufferData(gl.ARRAY_BUFFER, iso3dInstanceBuf.byteLength, gl.DYNAMIC_DRAW);
+				gl.enableVertexAttribArray(2);
+				gl.vertexAttribPointer(2, 3, gl.FLOAT, false, 20, 0);
+				gl.vertexAttribDivisor(2, 1);
+				gl.enableVertexAttribArray(3);
+				gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 20, 12);
+				gl.vertexAttribDivisor(3, 1);
+				gl.enableVertexAttribArray(4);
+				gl.vertexAttribPointer(4, 4, gl.UNSIGNED_BYTE, true, 20, 16);
+				gl.vertexAttribDivisor(4, 1);
+
+				// Floor guide
+				iso3dFloorVao = gl.createVertexArray();
+				gl.bindVertexArray(iso3dFloorVao);
+				gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+				gl.bufferData(gl.ARRAY_BUFFER, iso3dFloorGeometry(), gl.STATIC_DRAW);
+				gl.enableVertexAttribArray(0);
+				gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 12, 0);
+				gl.bindVertexArray(null);
+				// The world frame is lifted from the 2D canvas (u right, v down,
+				// z up), which is left-handed: under this projection every
+				// outward cube face winds clockwise in window coordinates, so
+				// CW must be the front face or culling would eat the tops.
+				gl.frontFace(gl.CW);
+			} catch (e) {
+				iso3dBroken = true;
+				iso3dGl = null;
+			}
+		}
+
+		function iso3dGpuReady() {
+			if (iso3dBroken || !iso3dSupported()) return false;
+			if (!iso3dInited) iso3dInit();
+			return !iso3dBroken && iso3dGl !== null;
+		}
+
+		// Stage one merged box run [z0, z0 + h) of a column. Consecutive
+		// equal-colour units merge into a single instance, which keeps the
+		// instance count at or below the pixel/particle budget of every mode
+		// even at extreme height scales. Returns false once the buffer is full.
+		function iso3dEmit(x, y, z0, h, color) {
+			if (iso3dInstanceCount >= ISO3D_MAX_INSTANCES) return false;
+			const o = iso3dInstanceCount * ISO3D_INSTANCE_FLOATS;
+			iso3dInstF32[o] = x;
+			iso3dInstF32[o + 1] = y;
+			iso3dInstF32[o + 2] = z0;
+			iso3dInstF32[o + 3] = h;
+			iso3dInstU32[o + 4] = color;
+			const top = z0 + h;
+			if (top > iso3dMaxTop) iso3dMaxTop = top;
+			iso3dInstanceCount++;
+			return true;
+		}
+
+		function iso3dUploadInstances() {
+			const gl = iso3dGl;
+			gl.bindBuffer(gl.ARRAY_BUFFER, iso3dInstGlBuf);
+			gl.bufferSubData(gl.ARRAY_BUFFER, 0, iso3dInstF32, 0, iso3dInstanceCount * ISO3D_INSTANCE_FLOATS);
+		}
+
+		// One orbit frame: floor guide first (blended, no depth writes), then
+		// the instanced boxes with the depth buffer, then composite onto the
+		// visible canvas and overlay the projected guide labels.
+		function iso3dDraw() {
+			const gl = iso3dGl;
+			if (!gl || iso3dBroken || !iso3dModeActive(engineSelector.value)) return;
+
+			const cosA = Math.cos(iso3dAz);
+			const sinA = Math.sin(iso3dAz);
+			const sinP = Math.sin(iso3dPitch);
+			const cosP = Math.cos(iso3dPitch);
+			// |toward| <= 180*sqrt(2) and z <= iso3dMaxTop, so this maps the
+			// whole scene into the depth range without clipping sane towers.
+			const depthScale = 1 / (520 + iso3dMaxTop);
+
+			gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+			gl.viewport(0, 0, W, H);
+			gl.clearColor(0.047, 0.047, 0.059, 1); // #0c0c0f, matches the painter guides
+			gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+
+			gl.disable(gl.DEPTH_TEST);
+			gl.disable(gl.CULL_FACE);
+			gl.enable(gl.BLEND);
+			gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+			gl.useProgram(iso3dFlatProg.prog);
+			gl.uniform4f(iso3dFlatProg.uView, cosA, sinA, sinP, cosP);
+			gl.uniform3f(iso3dFlatProg.uScreen, iso3dScale, ISO3D_PAN_PX, depthScale);
+			gl.bindVertexArray(iso3dFloorVao);
+			gl.uniform4f(iso3dFlatProg.uColor, 0.055, 0.055, 0.071, 1); // island disc
+			gl.drawArrays(gl.TRIANGLE_FAN, 0, 129);
+			gl.uniform4f(iso3dFlatProg.uColor, 1, 1, 1, 0.07); // saturation rings
+			for (let r = 0; r < 4; r++) gl.drawArrays(gl.LINE_LOOP, 129 + r * 128, 128);
+			gl.uniform4f(iso3dFlatProg.uColor, 1, 1, 1, 0.14); // rim emphasis
+			gl.drawArrays(gl.LINE_LOOP, 129 + 3 * 128, 128);
+			gl.uniform4f(iso3dFlatProg.uColor, 1, 1, 1, 0.05); // hue spokes
+			gl.drawArrays(gl.LINES, 129 + 4 * 128, 24);
+
+			gl.disable(gl.BLEND);
+			gl.enable(gl.DEPTH_TEST);
+			gl.enable(gl.CULL_FACE);
+			gl.useProgram(iso3dBoxProg.prog);
+			gl.uniform4f(iso3dBoxProg.uView, cosA, sinA, sinP, cosP);
+			gl.uniform3f(iso3dBoxProg.uScreen, iso3dScale, ISO3D_PAN_PX, depthScale);
+			gl.bindVertexArray(iso3dBoxVao);
+			if (iso3dInstanceCount > 0) {
+				gl.drawElementsInstanced(gl.TRIANGLES, 36, gl.UNSIGNED_SHORT, 0, iso3dInstanceCount);
+			}
+			gl.bindVertexArray(null);
+
+			destCtx.drawImage(iso3dCanvas, 0, 0);
+			drawIso3dLabels(cosA, sinA, sinP, cosP);
+		}
+
+		// Guide labels, projected through the live camera so they stay pinned
+		// to the rotating floor (same math as the shaders).
+		function drawIso3dLabels(cosA, sinA, sinP, cosP) {
+			const ctx = destCtx;
+			const cx = W * 0.5;
+			const cy = H * 0.5 + ISO3D_PAN_PX; // projection of the floor centre
+			ctx.font = '10px monospace';
+			ctx.textBaseline = 'middle';
+
+			// Saturation rings: pinned to the screen-right direction, so they
+			// never end up buried under the island at odd azimuths.
+			ctx.textAlign = 'left';
+			ctx.fillStyle = 'rgba(255, 255, 255, 0.25)';
+			for (let i = 1; i <= 4; i++) {
+				const f = i * 0.25;
+				ctx.fillText(`${Math.round(f * 100)}% ${iso3dRadialLabel}`, cx + f * 180 * iso3dScale + 13, cy);
+			}
+
+			// Hue spokes: the labels ride on the spoke ends and rotate with
+			// the floor.
+			ctx.textAlign = 'center';
+			ctx.fillStyle = 'rgba(255, 255, 255, 0.35)';
+			for (let deg = 0; deg < 360; deg += 30) {
+				const rad = deg * Math.PI / 180;
+				const wx = Math.cos(rad) * 194;
+				const wy = Math.sin(rad) * 194;
+				const right = wx * cosA - wy * sinA;
+				const toward = wx * sinA + wy * cosA;
+				const lx = cx + right * iso3dScale;
+				const ly = cy + toward * sinP * iso3dScale;
+				let colorGuide = '';
+				if (deg === 0) colorGuide = ' (R)';
+				else if (deg === 60) colorGuide = ' (Y)';
+				else if (deg === 120) colorGuide = ' (G)';
+				else if (deg === 180) colorGuide = ' (C)';
+				else if (deg === 240) colorGuide = ' (B)';
+				else if (deg === 300) colorGuide = ' (M)';
+				ctx.fillText(`${deg}°${colorGuide}`, lx, ly);
+			}
+		}
+
+		// --- SCENE BUILDERS (ONE PER 3D FAMILY) ---
+		// isometry: identical columns to the painter fallback, but consecutive
+		// equal-colour height units merge into single tall boxes. Returns the
+		// placed pixel count, or -1 when the GPU renderer is unavailable.
+		function iso3dRenderSkyscrapers(heightScale, heightLogGain) {
+			if (!iso3dGpuReady()) return -1;
+			iso3dRadialLabel = 'S';
+			iso3dInstanceCount = 0;
+			iso3dMaxTop = 0;
+			let placed = 0;
+			for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
+				const rowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM;
+				for (let gu = -ISO_GRID_BOUNDS; gu <= ISO_GRID_BOUNDS; gu++) {
+					const cellIdx = rowOffset + gu + ISO_GRID_BOUNDS;
+					const count = isoCellCount[cellIdx];
+					if (count === 0) continue;
+
+					const startOffset = isoCellOffset[cellIdx];
+					const displayHeight = Math.max(1, Math.round(Math.pow(count, heightLogGain) * heightScale));
+					let z = 0;
+					while (z < displayHeight) {
+						const colorIndex = Math.min(count - 1, Math.floor((z + 0.5) * count / displayHeight));
+						let z1 = z + 1;
+						while (z1 < displayHeight && Math.min(count - 1, Math.floor((z1 + 0.5) * count / displayHeight)) === colorIndex) z1++;
+						if (!iso3dEmit(gu - 0.5, gv - 0.5, z, z1 - z, isoSortedColors[startOffset + colorIndex])) {
+							// instance buffer full (absurd height scale): show
+							// what fits, exactly like the painter clips off-canvas
+							iso3dUploadInstances();
+							iso3dDraw();
+							return placed;
+						}
+						z = z1;
+					}
+					placed += count;
+				}
+			}
+			iso3dUploadInstances();
+			iso3dDraw();
+			return placed;
+		}
+
+		// lighttowers: one box per distinct colour, height from lightness.
+		// Returns false when the GPU renderer is unavailable.
+		function iso3dRenderLightTowers(towerCount, heightScale, heightLogGain) {
+			if (!iso3dGpuReady()) return false;
+			iso3dRadialLabel = 'max count';
+			iso3dInstanceCount = 0;
+			iso3dMaxTop = 0;
+			for (let i = 0; i < towerCount; i++) {
+				const displayHeight = Math.max(1, Math.round(Math.pow(ltTowerHeight[i], heightLogGain) * heightScale));
+				iso3dEmit(ltTowerX[i] - 0.5, ltTowerY[i] - 0.5, 0, displayHeight, ltTowerColor[i]);
+			}
+			iso3dUploadInstances();
+			iso3dDraw();
+			return true;
+		}
+
+		// sand/liquid: one box per run of equal-colour particles in every
+		// column, rebuilt on each simulation tick. Returns false when the GPU
+		// renderer is unavailable.
+		function iso3dRenderLiquid() {
+			if (!iso3dGpuReady()) return false;
+			iso3dRadialLabel = 'S';
+			iso3dInstanceCount = 0;
+			iso3dMaxTop = 0;
+			for (let cellIdx = 0; cellIdx < ISO_GRID_CELLS; cellIdx++) {
+				let p = liqHead[cellIdx];
+				if (p === -1) continue;
+
+				const gu = (cellIdx % ISO_GRID_DIM) - ISO_GRID_BOUNDS;
+				const gv = ((cellIdx / ISO_GRID_DIM) | 0) - ISO_GRID_BOUNDS;
+				const x = gu - 0.5;
+				const y = gv - 0.5;
+				let z = 0;
+				while (p !== -1) {
+					const color = liqColor[p];
+					const z0 = z;
+					while (p !== -1 && liqColor[p] === color) {
+						z++;
+						p = liqNext[p];
+					}
+					if (!iso3dEmit(x, y, z0, z - z0, color)) {
+						// particle budget reached: draw what fits
+						p = -1;
+					}
+				}
+			}
+			iso3dUploadInstances();
+			iso3dDraw();
+			return true;
+		}
+
+		// Camera affordances only exist while a 3D mode is actually rendering
+		// through WebGL2; the JS painter keeps its fixed view.
+		function iso3dUpdateInteractive() {
+			const active = iso3dModeActive(engineSelector.value) && !iso3dBroken && iso3dSupported();
+			canvasContainer.classList.toggle('canvas-orbit', active);
+			cameraHint.style.display = active ? 'block' : 'none';
+		}
+
+		// Camera-only frame: re-draws the staged scene under the new view
+		// without re-running any placement or simulation pass.
+		function iso3dScheduleFrame() {
+			if (iso3dFramePending) return;
+			iso3dFramePending = true;
+			requestAnimationFrame(() => {
+				iso3dFramePending = false;
+				iso3dDraw();
+			});
+		}
+
+		function iso3dZoom(factor) {
+			iso3dScale *= factor;
+			if (iso3dScale < ISO3D_MIN_SCALE) iso3dScale = ISO3D_MIN_SCALE;
+			else if (iso3dScale > ISO3D_MAX_SCALE) iso3dScale = ISO3D_MAX_SCALE;
+			iso3dScheduleFrame();
 		}
 
 		// --- 2D PRESSURE MODE: GAS RELAXATION (WEBGL SOLVE + CPU TRANSPORT) ---
@@ -3105,5 +3746,4 @@ void main() {
 		// Run
 		init();
 	</script>
-<script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a09c140ae80d62d5',t:'MTc4MTEzMzMyOQ=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script></body>
 </html>

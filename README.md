@@ -35,6 +35,12 @@ All 3D modes support linear or logarithmic tower heights. base `1.00` keeps line
 
 All 3D modes also have an "Auto scale" checkbox (on by default): it picks the height factor that fits the tallest tower of the current image into the view and syncs the Tower Height Scale slider to exactly that value. dragging the slider manually turns the autoscale off. in sand and liquid modes the factor is additionally clamped so the particle budget is never exceeded, since every height unit there is one real particle.
 
+### 3d camera
+
+all four 3D modes render through a WebGL2 instanced-box renderer with a real depth buffer, so the whole island is a live 3D scene: drag to orbit the camera around the island centre (azimuth + pitch), scroll the mouse wheel or pinch with two fingers to zoom, double-click to reset the view. the camera state survives mode switches and image changes; moving it only re-draws the staged scene, so it never re-runs the placement or relaxation passes. the floor guide (saturation rings, hue spokes and their labels) is projected through the same camera, so it rotates and tilts together with the island.
+
+why WebGL2: a freely rotating camera breaks the fixed back-to-front painter order, so correct occlusion needs a per-pixel depth test over up to 120k boxes — millions of depth-tested pixel writes per frame, far beyond interactive plain JS on the typed-array grid. consecutive equal-colour height units are merged into single tall boxes, which keeps every scene at or below one instanced draw call of 120k instances even at extreme height scales. when WebGL2 is unavailable (or the context is lost mid-session) the 3D modes automatically fall back to the original fixed-view Canvas2D painter — identical towers, no camera controls — exactly like before.
+
 ### web site
 
 https://github.com/Yuki2ka/i2hsl_circle/index.html

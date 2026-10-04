@@ -1,0 +1,3 @@
+for 3d modes make possible to rotate camera around center and zoom with wheel and touch.
+
+think can this be fast in js or need webGL. if need - then implement in webGL with fallback to js without such functionality
