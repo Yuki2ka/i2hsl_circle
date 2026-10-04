@@ -246,6 +246,26 @@
 			background: var(--accent-hover);
 		}
 
+		/* Checkbox row (tower height autoscale) */
+		.checkbox-row {
+			display: flex;
+			align-items: center;
+			gap: 8px;
+			margin-top: 10px;
+			font-size: 12px;
+			color: var(--text-muted);
+			cursor: pointer;
+			user-select: none;
+		}
+
+		.checkbox-row input[type="checkbox"] {
+			width: 15px;
+			height: 15px;
+			accent-color: var(--accent);
+			cursor: pointer;
+			flex: none;
+		}
+
 		/* Button styling */
 		.btn {
 			display: inline-flex;
@@ -481,6 +501,7 @@
 						<option value="naive">2D Swarm: O(N²) Naive Search</option>
 						<option value="isometry">3D Isometric Skyscrapers</option>
 						<option value="lighttowers">3D: Count→Radius, Light→Height</option>
+						<option value="liquid">3D: Skyscrapers → Liquid Relaxation</option>
 					</select>
 				</div>
 				<div class="control-group">
@@ -492,15 +513,19 @@
 						<input type="range" id="max-pixels-slider" min="1000" max="100000" step="1000" value="50000">
 					</div>
 				</div>
-				<!-- Tower controls (visible in both 3D modes) -->
+				<!-- Tower controls (visible in all 3D modes) -->
 				<div class="control-group" id="height-scale-group" style="display: none;">
 					<div class="control-label">
 						<span>Tower Height Scale</span>
-						<span class="control-value" id="height-scale-val">1.0</span>
+						<span class="control-value" id="height-scale-val">1.00</span>
 					</div>
 					<div class="slider-container">
-						<input type="range" id="height-scale-slider" min="0.1" max="4.0" step="0.1" value="1.0" aria-label="Tower height scale">
+						<input type="range" id="height-scale-slider" min="0.02" max="4.0" step="0.02" value="1.0" aria-label="Tower height scale">
 					</div>
+					<label class="checkbox-row" for="autoscale-check">
+						<input type="checkbox" id="autoscale-check" checked>
+						<span>Auto scale — fit tallest tower into view</span>
+					</label>
 				</div>
 				<div class="control-group" id="height-log-group" style="display: none;">
 					<div class="control-label">
@@ -598,6 +623,34 @@
 		const ltDepthCurrentOffset = new Uint32Array(ISO_GRID_DIM);
 		const ltSortedTowerIndices = new Uint32Array(LT_MAX_TOWERS);
 
+		// Liquid relaxation: every drawn height unit is one real particle that
+		// keeps its exact color forever. Columns taller than a neighbor by more
+		// than 1 pour their top particles into the lowest neighboring column,
+		// exactly like incompressible immiscible fluids leveling out: total
+		// volume (particle count) is conserved, colors never mix, and growing
+		// towers push neighboring pixels aside.
+		const LIQ_MAX_PARTICLES = 120000; // matches the isoSortedColors safe capacity
+		const LIQ_QUEUE_CAP = 131072;     // 2^17 ring buffer, one entry per grid cell at most
+		const LIQ_QUEUE_MASK = LIQ_QUEUE_CAP - 1;
+		const TOWER_AUTOSCALE_MAX = 220;  // autoscale target for the tallest tower, in pixels
+		const liqNext = new Int32Array(LIQ_MAX_PARTICLES);   // particle above in the column, -1 = top
+		const liqPrev = new Int32Array(LIQ_MAX_PARTICLES);   // particle below in the column, -1 = bottom
+		const liqColor = new Uint32Array(LIQ_MAX_PARTICLES); // exact ABGR color of the particle
+		const liqHead = new Int32Array(ISO_GRID_CELLS);      // bottom particle per cell, -1 = empty
+		const liqTail = new Int32Array(ISO_GRID_CELLS);      // top particle per cell, -1 = empty
+		const liqHeight = new Int32Array(ISO_GRID_CELLS);    // current liquid column height
+		const liqCellPow = new Float32Array(ISO_GRID_CELLS); // count^logGain per occupied cell
+		const liqIsland = new Uint8Array(ISO_GRID_CELLS);    // 1 inside the circular island
+		const liqQueue = new Int32Array(LIQ_QUEUE_CAP);      // unstable-column work queue (deduplicated)
+		const liqQueued = new Uint8Array(ISO_GRID_CELLS);
+		let liqParticleCount = 0;
+		let liqQueueHead = 0;
+		let liqQueueTail = 0;
+		let liqQueueCount = 0;
+		let liqRot = 0;       // rotating neighbor scan order, keeps the flow isotropic
+		let liqAnimActive = false;
+		let liqSimTime = 0;   // cumulative relaxation compute time for the stats panel
+
 		// --- DOM ELEMENTS ---
 		const destCanvas = document.getElementById('hsl-canvas');
 		const destCtx = destCanvas.getContext('2d', { alpha: false, desynchronized: true });
@@ -613,6 +666,7 @@
 		const heightScaleGroup = document.getElementById('height-scale-group');
 		const heightScaleSlider = document.getElementById('height-scale-slider');
 		const heightScaleVal = document.getElementById('height-scale-val');
+		const autoscaleCheck = document.getElementById('autoscale-check');
 		const heightLogGroup = document.getElementById('height-log-group');
 		const heightLogSlider = document.getElementById('height-log-slider');
 		const heightLogVal = document.getElementById('height-log-val');
@@ -652,6 +706,7 @@
 		// --- INITIALIZATION ---
 		function init() {
 			initSpiral();
+			initLiquidIsland();
 			setupEventListeners();
 			loadPreset('wheel');
 		}
@@ -675,6 +730,19 @@
 			}
 		}
 
+		// The liquid never leaves the circular HSL island: only cells inside the
+		// r <= 180 disk may ever receive flowing particles. Cells just outside the
+		// rim (reachable through coordinate rounding) may hold initial liquid but
+		// can only drain onto the island, never grow.
+		function initLiquidIsland() {
+			for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
+				const rowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM - ISO_GRID_BOUNDS;
+				for (let gu = -ISO_GRID_BOUNDS; gu <= ISO_GRID_BOUNDS; gu++) {
+					liqIsland[rowOffset + gu] = gu * gu + gv * gv <= 180 * 180 ? 1 : 0;
+				}
+			}
+		}
+
 		function setupEventListeners() {
 			// Slider changes (live rendering using requestAnimationFrame)
 			maxPixelsSlider.addEventListener('input', () => {
@@ -683,7 +751,13 @@
 			});
 
 			heightScaleSlider.addEventListener('input', () => {
-				heightScaleVal.textContent = parseFloat(heightScaleSlider.value).toFixed(1);
+				// Manual drag overrides the autoscale: uncheck it and keep dragging
+				if (autoscaleCheck.checked) autoscaleCheck.checked = false;
+				heightScaleVal.textContent = parseFloat(heightScaleSlider.value).toFixed(2);
+				scheduleRender();
+			});
+
+			autoscaleCheck.addEventListener('change', () => {
 				scheduleRender();
 			});
 
@@ -695,7 +769,7 @@
 
 			engineSelector.addEventListener('change', () => {
 				const style = engineSelector.value;
-				const is3D = style === 'isometry' || style === 'lighttowers';
+				const is3D = style === 'isometry' || style === 'lighttowers' || style === 'liquid';
 				heightScaleGroup.style.display = is3D ? 'block' : 'none';
 				heightLogGroup.style.display = is3D ? 'block' : 'none';
 				scheduleRender();
@@ -1071,7 +1145,7 @@
 				const cxIso = 300;
 				const cyIso = 340; // Shifted down slightly to leave vertical space for skyscrapers
 				const R_max_iso = 180;
-				const heightScale = parseFloat(heightScaleSlider.value);
+				let heightScale = parseFloat(heightScaleSlider.value);
 				const heightLogBase = parseFloat(heightLogSlider.value);
 				const heightLogGain = 1 - Math.log(heightLogBase);
 
@@ -1080,6 +1154,7 @@
 				isoCellCurrentOffset.fill(0);
 
 				// Pass 1: Count pixels per discrete grid cell on circular island
+				let maxCount = 0;
 				for (let i = 0; i < pixelCount; i++) {
 					const srcIdx = i * 4;
 					const a = srcData[srcIdx + 3];
@@ -1124,7 +1199,14 @@
 					const gv = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(v)));
 					const gridIdx = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM + (gu + ISO_GRID_BOUNDS);
 
-					isoCellCount[gridIdx]++;
+					const cellCount = ++isoCellCount[gridIdx];
+					if (cellCount > maxCount) maxCount = cellCount;
+				}
+
+				// Autoscale: fit the tallest tower into the view. The slider is
+				// synced to the exact snapped factor that this render uses.
+				if (autoscaleCheck.checked && maxCount > 0) {
+					heightScale = syncHeightScaleSlider(TOWER_AUTOSCALE_MAX / Math.pow(maxCount, heightLogGain));
 				}
 
 				// Compute prefix sum offsets (linear binning partition)
@@ -1225,7 +1307,7 @@
 				const cxLT = 300;
 				const cyLT = 350;
 				const R_max_lt = 180;
-				const heightScale = parseFloat(heightScaleSlider.value);
+				let heightScale = parseFloat(heightScaleSlider.value);
 				const heightLogBase = parseFloat(heightLogSlider.value);
 				const heightLogGain = 1 - Math.log(heightLogBase);
 
@@ -1237,6 +1319,7 @@
 
 				let towerCount = 0;
 				let maxColorCount = 0;
+				let maxTowerRaw = 0;
 
 				// Aggregate equal RGB pixels. The table uses RGB + 1 so zero remains
 				// the empty-slot marker, including for pure black source pixels.
@@ -1302,9 +1385,17 @@
 
 					ltTowerX[i] = gu;
 					ltTowerY[i] = gv;
-					ltTowerHeight[i] = Math.round(lightness * LT_MAX_HEIGHT);
+					const rawHeight = Math.round(lightness * LT_MAX_HEIGHT);
+					ltTowerHeight[i] = rawHeight;
+					if (rawHeight > maxTowerRaw) maxTowerRaw = rawHeight;
 					ltTowerColor[i] = 0xFF000000 | (b << 16) | (g << 8) | r;
 					ltDepthCount[gv + ISO_GRID_BOUNDS]++;
+				}
+
+				// Autoscale: fit the tallest tower into the view. The slider is
+				// synced to the exact snapped factor that this render uses.
+				if (autoscaleCheck.checked && towerCount > 0) {
+					heightScale = syncHeightScaleSlider(TOWER_AUTOSCALE_MAX / Math.pow(maxTowerRaw, heightLogGain));
 				}
 
 				// Counting-sort towers by floor depth for back-to-front occlusion.
@@ -1346,6 +1437,235 @@
 				offscreenPlacementCtx.putImageData(destImgData, 0, 0);
 				drawBackgroundGuideIsometry(destCtx, W, H, cxLT, cyLT, R_max_lt, 'max count');
 				destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+
+			} else if (vizStyle === 'liquid') {
+				// --- 3D LIQUID RELAXATION (IMMISCIBLE) ---
+				// Stage 1 is identical to 3D Isometric Skyscrapers: hue -> angle,
+				// saturation -> radius, cell population -> tower height, exact
+				// colors bucketed per cell. Stage 2 (animated) treats every drawn
+				// height unit as one liquid particle: unstable columns pour their
+				// top particles into the lowest neighboring column until every
+				// neighbor pair is within ±1. Volume and per-particle colors are
+				// conserved forever, so colors flow around and over each other
+				// like immiscible liquids instead of blending.
+				const cxLiq = 300;
+				const cyLiq = 340; // Same layout as the skyscraper island
+				const R_max_liq = 180;
+				const heightLogBase = parseFloat(heightLogSlider.value);
+				const heightLogGain = 1 - Math.log(heightLogBase);
+
+				// Reset the simulation state (pre-allocated, zero GC)
+				liqHead.fill(-1);
+				liqTail.fill(-1);
+				liqHeight.fill(0);
+				liqQueued.fill(0);
+				liqQueueHead = 0;
+				liqQueueTail = 0;
+				liqQueueCount = 0;
+				liqParticleCount = 0;
+				liqRot = 0;
+
+				isoCellCount.fill(0);
+				isoCellOffset.fill(0);
+				isoCellCurrentOffset.fill(0);
+
+				// Pass 1: Count pixels per discrete grid cell, track the tallest
+				let maxCount = 0;
+				for (let i = 0; i < pixelCount; i++) {
+					const srcIdx = i * 4;
+					const a = srcData[srcIdx + 3];
+					if (a < 10) continue;
+
+					const r = srcData[srcIdx];
+					const g = srcData[srcIdx + 1];
+					const b = srcData[srcIdx + 2];
+
+					const rf = r / 255;
+					const gf = g / 255;
+					const bf = b / 255;
+					const max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+					const min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+
+					let h = 0;
+					let s = 0;
+					const l = (max + min) * 0.5;
+
+					if (max !== min) {
+						const d = max - min;
+						s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+						if (max === rf) {
+							h = (gf - bf) / d + (gf < bf ? 6 : 0);
+						} else if (max === gf) {
+							h = (bf - rf) / d + 2;
+						} else {
+							h = (rf - gf) / d + 4;
+						}
+						h /= 6;
+					}
+
+					const theta = h * 2 * Math.PI;
+					const r_dist = s * R_max_liq;
+					const u = r_dist * Math.cos(theta);
+					const v = r_dist * Math.sin(theta);
+
+					const gu = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(u)));
+					const gv = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(v)));
+					const gridIdx = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM + (gu + ISO_GRID_BOUNDS);
+
+					const cellCount = ++isoCellCount[gridIdx];
+					if (cellCount > maxCount) maxCount = cellCount;
+				}
+
+				// Compute prefix sum offsets (linear binning partition)
+				let sum = 0;
+				for (let i = 0; i < ISO_GRID_CELLS; i++) {
+					isoCellOffset[i] = sum;
+					isoCellCurrentOffset[i] = sum;
+					sum += isoCellCount[i];
+				}
+
+				// Pass 2: Sort colors into the pre-allocated flat array
+				for (let i = 0; i < pixelCount; i++) {
+					const srcIdx = i * 4;
+					const a = srcData[srcIdx + 3];
+					if (a < 10) continue;
+
+					const r = srcData[srcIdx];
+					const g = srcData[srcIdx + 1];
+					const b = srcData[srcIdx + 2];
+
+					const rf = r / 255;
+					const gf = g / 255;
+					const bf = b / 255;
+					const max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+					const min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+
+					let h = 0;
+					let s = 0;
+					const l = (max + min) * 0.5;
+
+					if (max !== min) {
+						const d = max - min;
+						s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+						if (max === rf) {
+							h = (gf - bf) / d + (gf < bf ? 6 : 0);
+						} else if (max === gf) {
+							h = (bf - rf) / d + 2;
+						} else {
+							h = (rf - gf) / d + 4;
+						}
+						h /= 6;
+					}
+
+					const theta = h * 2 * Math.PI;
+					const r_dist = s * R_max_liq;
+					const u = r_dist * Math.cos(theta);
+					const v = r_dist * Math.sin(theta);
+
+					const gu = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(u)));
+					const gv = Math.max(-ISO_GRID_BOUNDS, Math.min(ISO_GRID_BOUNDS, Math.round(v)));
+					const gridIdx = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM + (gu + ISO_GRID_BOUNDS);
+
+					const writeIdx = isoCellCurrentOffset[gridIdx]++;
+					isoSortedColors[writeIdx] = 0xFF000000 | (b << 16) | (g << 8) | r;
+				}
+
+				// Resolve the height scale. Every drawn height unit is one real
+				// particle here, so beyond the autoscale target the factor is
+				// additionally clamped by the total particle budget.
+				let liqScale = parseFloat(heightScaleSlider.value);
+				if (autoscaleCheck.checked && maxCount > 0) {
+					liqScale = TOWER_AUTOSCALE_MAX / Math.pow(maxCount, heightLogGain);
+				}
+				for (let i = 0; i < ISO_GRID_CELLS; i++) {
+					liqCellPow[i] = isoCellCount[i] === 0 ? 0 : Math.pow(isoCellCount[i], heightLogGain);
+				}
+				let estTotal = 0;
+				for (let i = 0; i < ISO_GRID_CELLS; i++) {
+					if (liqCellPow[i] === 0) continue;
+					const units = Math.round(liqCellPow[i] * liqScale);
+					estTotal += units < 1 ? 1 : units;
+				}
+				if (estTotal > LIQ_MAX_PARTICLES) {
+					liqScale *= LIQ_MAX_PARTICLES / estTotal;
+					estTotal = 0;
+					for (let i = 0; i < ISO_GRID_CELLS; i++) {
+						if (liqCellPow[i] === 0) continue;
+						const units = Math.round(liqCellPow[i] * liqScale);
+						estTotal += units < 1 ? 1 : units;
+					}
+				}
+				if (liqScale < 0.02) liqScale = 0.02;
+				if (liqScale > 4.0) liqScale = 4.0;
+				if (autoscaleCheck.checked && maxCount > 0) {
+					// Sync the GUI slider to the exact factor used (incl. clamps)
+					liqScale = syncHeightScaleSlider(liqScale);
+				}
+
+				// Pass 3: Build one particle per drawn height unit. Bucketed
+				// colors are sampled proportionally exactly like the static
+				// skyscraper renderer, so the first frame looks identical.
+				let particleIdx = 0;
+				for (let cellIdx = 0; cellIdx < ISO_GRID_CELLS; cellIdx++) {
+					const count = isoCellCount[cellIdx];
+					if (count === 0) continue;
+
+					// Same float64 expression as the skyscraper renderer so the
+					// initial tower heights match it exactly
+					let units = Math.round(Math.pow(count, heightLogGain) * liqScale);
+					if (units < 1) units = 1;
+					if (particleIdx + units > LIQ_MAX_PARTICLES) units = LIQ_MAX_PARTICLES - particleIdx;
+					if (units <= 0) break;
+
+					const startOffset = isoCellOffset[cellIdx];
+					for (let z = 0; z < units; z++) {
+						const colorIndex = Math.min(count - 1, Math.floor((z + 0.5) * count / units));
+						const p = particleIdx++;
+						liqColor[p] = isoSortedColors[startOffset + colorIndex];
+						liqPrev[p] = liqTail[cellIdx];
+						liqNext[p] = -1;
+						if (liqTail[cellIdx] === -1) liqHead[cellIdx] = p;
+						else liqNext[liqTail[cellIdx]] = p;
+						liqTail[cellIdx] = p;
+					}
+					liqHeight[cellIdx] = units;
+					placedCount += count;
+				}
+				liqParticleCount = particleIdx;
+
+				// Seed the relaxation with every column that currently towers
+				// above one of its island neighbors (stable columns are never
+				// queued; they get pushed once a neighbor changes their status)
+				for (let cellIdx = 0; cellIdx < ISO_GRID_CELLS; cellIdx++) {
+					const hC = liqHeight[cellIdx];
+					if (hC < 2) continue;
+
+					const gu = (cellIdx % ISO_GRID_DIM) - ISO_GRID_BOUNDS;
+					const gv = ((cellIdx / ISO_GRID_DIM) | 0) - ISO_GRID_BOUNDS;
+					let minH = 0x7FFFFFFF;
+					if (gu > -ISO_GRID_BOUNDS && liqIsland[cellIdx - 1] === 1) {
+						const hn = liqHeight[cellIdx - 1];
+						if (hn < minH) minH = hn;
+					}
+					if (gu < ISO_GRID_BOUNDS && liqIsland[cellIdx + 1] === 1) {
+						const hn = liqHeight[cellIdx + 1];
+						if (hn < minH) minH = hn;
+					}
+					if (gv > -ISO_GRID_BOUNDS && liqIsland[cellIdx - ISO_GRID_DIM] === 1) {
+						const hn = liqHeight[cellIdx - ISO_GRID_DIM];
+						if (hn < minH) minH = hn;
+					}
+					if (gv < ISO_GRID_BOUNDS && liqIsland[cellIdx + ISO_GRID_DIM] === 1) {
+						const hn = liqHeight[cellIdx + ISO_GRID_DIM];
+						if (hn < minH) minH = hn;
+					}
+					if (minH !== 0x7FFFFFFF && hC - minH > 1) liqPushCell(cellIdx);
+				}
+
+				// Show the initial skyscraper state, then relax it over time
+				drawLiquidFrame(cxLiq, cyLiq);
+				liqSimTime = performance.now() - startTime;
+				startLiquidAnimation();
 
 			} else {
 				// --- 2D SWARM (O(1) OPTIMIZED OR O(N^2) NAIVE) ---
@@ -1439,6 +1759,196 @@
 				}
 			}
 			return placedCount;
+		}
+
+		// --- TOWER HEIGHT AUTOSCALE (ALL 3D MODES) ---
+		// Snap the computed factor onto the slider grid so the GUI always shows
+		// exactly the value the renderer used, then return the snapped factor.
+		function syncHeightScaleSlider(scale) {
+			let v = Math.round(scale * 50) / 50;
+			if (v < 0.02) v = 0.02;
+			if (v > 4.0) v = 4.0;
+			heightScaleSlider.value = v;
+			heightScaleVal.textContent = v.toFixed(2);
+			return v;
+		}
+
+		// --- LIQUID RELAXATION SIMULATION (EVENT-DRIVEN, ZERO ALLOCATION) ---
+		// Only occupied columns are ever queued: an empty column can never be the
+		// unstable (taller) side of a pair, and every column that receives liquid
+		// is re-queued through its own neighborhood push.
+		function liqPushCell(cellIdx) {
+			if (liqHeight[cellIdx] > 0 && liqQueued[cellIdx] === 0) {
+				liqQueued[cellIdx] = 1;
+				liqQueue[liqQueueTail] = cellIdx;
+				liqQueueTail = (liqQueueTail + 1) & LIQ_QUEUE_MASK;
+				liqQueueCount++;
+			}
+		}
+
+		// After any height change both changed columns and all their neighbors may
+		// have become unstable, so their whole cross-neighborhood is re-queued.
+		function liqPushNeighborhood(cellIdx) {
+			liqPushCell(cellIdx);
+			const gu = (cellIdx % ISO_GRID_DIM) - ISO_GRID_BOUNDS;
+			const gv = ((cellIdx / ISO_GRID_DIM) | 0) - ISO_GRID_BOUNDS;
+			if (gu > -ISO_GRID_BOUNDS) liqPushCell(cellIdx - 1);
+			if (gu < ISO_GRID_BOUNDS) liqPushCell(cellIdx + 1);
+			if (gv > -ISO_GRID_BOUNDS) liqPushCell(cellIdx - ISO_GRID_DIM);
+			if (gv < ISO_GRID_BOUNDS) liqPushCell(cellIdx + ISO_GRID_DIM);
+		}
+
+		// Process unstable columns off the work queue. A column pours only into
+		// its lowest island neighbor and only while the height difference exceeds
+		// 1, so the potential sum(h^2) strictly decreases with every moved
+		// particle: the relaxation provably terminates with every neighboring
+		// column pair within ±1 of each other and a fully drained queue. Flat
+		// puddles form where the liquid is thin; where volume concentrates it
+		// settles into gentle slope-1 mounds, like viscous immiscible droplets.
+		function liqStep(maxEvents) {
+			let events = 0;
+			const t0 = performance.now();
+			while (liqQueueCount > 0 && events < maxEvents) {
+				if ((events & 127) === 0 && performance.now() - t0 > 8) break;
+				const cell = liqQueue[liqQueueHead];
+				liqQueueHead = (liqQueueHead + 1) & LIQ_QUEUE_MASK;
+				liqQueueCount--;
+				liqQueued[cell] = 0;
+				events++;
+
+				const hC = liqHeight[cell];
+				if (hC < 2) continue; // can never tower above a neighbor by more than 1
+
+				const gu = (cell % ISO_GRID_DIM) - ISO_GRID_BOUNDS;
+				const gv = ((cell / ISO_GRID_DIM) | 0) - ISO_GRID_BOUNDS;
+				liqRot = (liqRot + 1) & 3;
+
+				// Find the lowest neighbor, scanning in rotating order so the flow
+				// stays isotropic instead of draining along one fixed direction
+				let bestN = -1;
+				let bestH = 0x7FFFFFFF;
+				for (let k = 0; k < 4; k++) {
+					const dir = (liqRot + k) & 3;
+					let n = -1;
+					if (dir === 0) {
+						if (gu > -ISO_GRID_BOUNDS) n = cell - 1;
+					} else if (dir === 1) {
+						if (gu < ISO_GRID_BOUNDS) n = cell + 1;
+					} else if (dir === 2) {
+						if (gv > -ISO_GRID_BOUNDS) n = cell - ISO_GRID_DIM;
+					} else if (gv < ISO_GRID_BOUNDS) {
+						n = cell + ISO_GRID_DIM;
+					}
+					if (n === -1 || liqIsland[n] === 0) continue;
+					const hn = liqHeight[n];
+					if (hn < bestH) {
+						bestH = hn;
+						bestN = n;
+					}
+				}
+				if (bestN === -1) continue;
+				const diff = hC - bestH;
+				if (diff <= 1) continue;
+
+				// Pour the top particles onto the lowest neighbor. Late arrivals
+				// rest on top, so an overtopped column later sheds the visitor's
+				// particles onward: liquids slide over each other without mixing.
+				let moves = diff >> 1;
+				if (moves > 6) moves = 6;
+				while (moves > 0) {
+					const p = liqTail[cell];
+					if (p === -1) break;
+
+					// Unlink the top particle from the source column
+					const below = liqPrev[p];
+					liqTail[cell] = below;
+					if (below === -1) liqHead[cell] = -1;
+					else liqNext[below] = -1;
+					liqHeight[cell]--;
+
+					// Append it as the new top of the destination column
+					const top = liqTail[bestN];
+					liqPrev[p] = top;
+					if (top === -1) liqHead[bestN] = p;
+					else liqNext[top] = p;
+					liqTail[bestN] = p;
+					liqNext[p] = -1;
+					liqHeight[bestN]++;
+					moves--;
+				}
+				liqPushNeighborhood(cell);
+				liqPushNeighborhood(bestN);
+			}
+			return events;
+		}
+
+		// Paint the liquid height field back-to-front (painter's depth occlusion),
+		// one 3px pillar slice per particle. Column walks stay allocation-free.
+		function drawLiquidFrame(cx, cy) {
+			grid.fill(0);
+			for (let gv = -ISO_GRID_BOUNDS; gv <= ISO_GRID_BOUNDS; gv++) {
+				const rowOffset = (gv + ISO_GRID_BOUNDS) * ISO_GRID_DIM;
+				const baseSY = cy + gv * 0.5; // Tilted aspect: squish Y by 0.5
+
+				for (let gu = -ISO_GRID_BOUNDS; gu <= ISO_GRID_BOUNDS; gu++) {
+					const cellIdx = rowOffset + gu + ISO_GRID_BOUNDS;
+					let p = liqHead[cellIdx];
+					if (p === -1) continue;
+
+					const baseSX = cx + gu;
+					let z = 0;
+					while (p !== -1) {
+						const sy = Math.round(baseSY - z);
+						if (sy < 0) break; // everything above is off-canvas
+						if (sy < H && baseSX >= 1 && baseSX < W - 1) {
+							const gIdx = sy * W + baseSX;
+							const color = liqColor[p];
+							grid[gIdx - 1] = color;
+							grid[gIdx] = color;
+							grid[gIdx + 1] = color;
+						}
+						z++;
+						p = liqNext[p];
+					}
+				}
+			}
+			offscreenPlacementCtx.putImageData(destImgData, 0, 0);
+			drawBackgroundGuideIsometry(destCtx, W, H, cx, cy, 180);
+			destCtx.drawImage(offscreenPlacementCanvas, 0, 0);
+		}
+
+		// Animated relaxation loop: a bounded number of unstable-column events per
+		// frame keeps the flow smooth to watch, while an 8ms inner time cap keeps
+		// the browser responsive. The loop drains itself when the island is level.
+		function startLiquidAnimation() {
+			if (liqAnimActive) return;
+			liqAnimActive = true;
+			requestAnimationFrame(liqAnimationTick);
+		}
+
+		function liqAnimationTick() {
+			if (engineSelector.value !== 'liquid' || liqQueueCount === 0) {
+				liqAnimActive = false;
+				return;
+			}
+
+			// Event budget tracks the current instability: the queue length is the
+			// pending work, so calm scenes idle at the floor while heavy flowing
+			// accelerates, and the animation decelerates smoothly as it settles.
+			// Queue dedup caps every column at one pour per frame, which keeps the
+			// flow viscous no matter how large the budget grows.
+			let maxEvents = liqQueueCount >> 2;
+			if (maxEvents < 150) maxEvents = 150;
+			else if (maxEvents > 8000) maxEvents = 8000;
+
+			const t0 = performance.now();
+			liqStep(maxEvents);
+			liqSimTime += performance.now() - t0;
+			drawLiquidFrame(300, 340);
+			statsTime.textContent = liqSimTime.toFixed(1) + ' ms';
+
+			if (liqQueueCount > 0) requestAnimationFrame(liqAnimationTick);
+			else liqAnimActive = false;
 		}
 
 		// --- HEAD-TO-HEAD SPEED BENCHMARK ---
