@@ -1,0 +1,49 @@
+## What was added
+
+**1. Direct/Reverse mode toggle**
+A segmented toggle at the top of the sidebar switches the source panel between **Direct: Image → HSL** and **Reverse: HSL → Image**. Switching is lossless in both directions — the direct source (presets got their own backing canvas so the mosaic no longer clobbers them) and the loaded heightmap each survive the trip. First entry into Reverse auto-loads the spiral example.
+
+**2. Working roundtrip (spiral survives hsl → img → hsl)**
+Two fixes make the cycle hold:
+- **Exact-source path** — the direct pipeline used to rescale every source with smoothing, blending mosaic pixels into off-palette colors that scatter across the diagram. The roundtrip source is now flagged exact: passed through 1:1 when it fits the pixel budget, nearest-neighbor otherwise — palette colors are never blended.
+- **Palette refinement** — each cell's canonical color is snapped (once, lazily, ~400 ms on first reverse use) to the 8-bit RGB value within ±2/255 per channel whose RGB→HSL→polar position lands back on *exactly* that cell. Exact-cell returns jump from ~50% to ~85%, and every residual displacement is bounded to 1 px.
+
+The **Roundtrip Mosaic → HSL Diagram** button runs the cycle live: generate the spiral, click it, and the spiral reappears in the 2D swarm (works in the 3D modes too).
+
+**3. Roundtrip tests + loss %**
+- In-page **Test Roundtrip Loss %** button reports a WORKS/DEGRADED verdict with mean/max position error, % within ≤1 px, shape loss (7 px-bin total variation) and exact-cell loss split from the sampling-quantization floor.
+- Headless `node test/roundtrip.test.mjs` extracts the *real* functions from `index.html` and asserts the bounds. Results for the spiral at 50k pixels:
+
+| Metric | Before fixes | After |
+|---|---|---|
+| Mean position error | 0.53 px | **0.14 px** |
+| Max position error | 1.41 px | **1.00 px** |
+| Pixels within ≤1 px | 94.0% | **100%** |
+| Shape loss (7 px bins) | 3.49% | **1.48%** |
+| Shape preserved | 96.5% | **98.5%** |
+
+All 8 checks pass — the roundtrip works, with ~1.5% distribution loss (of which 5.2% exact-cell loss is the unavoidable quantization floor of sampling a continuous heightmap into 50k discrete pixels).
+
+
+
+## New toggle behavior (nothing is cleared)
+
+- **Direct → Reverse**: the current image is converted into its HSL heightmap. Every resampled pixel is binned into its hue/saturation cell on the polar map (same math as the placement engines, with rim-rounding pixels pulled back onto the disk), and the per-cell population becomes the grayscale height — densest cell = white, occupied cells never drop below height 1 so no color vanishes. You immediately see the gray distribution of whatever image you had loaded.
+- **Reverse → Direct**: the generated mosaic becomes the direct source (fed through the exact, no-resampling path). The separate "Roundtrip" button was removed since the toggle itself now does that; the **Test Roundtrip Loss %** button stays.
+
+So flipping back and forth carries the same distribution through repeated hsl → img → hsl cycles: spiral → toggle Direct (mosaic) → toggle Reverse → the spiral heightmap is rebuilt from the mosaic's actual pixels, not restored from memory.
+
+Fallbacks: a degenerate all-black map falls back to the previous direct source, and an unusable image (fully transparent) re-enters the last heightmap or the spiral example.
+
+## Test results (new Test 3 covers the full toggle cycle)
+
+```
+Test 3: toggle cycle heightmap -> mosaic -> heightmap
+  [PASS] every mosaic pixel lands on the disk — 49794/49794
+  full-cycle shape loss (7px bins): 1.531%
+  [PASS] spiral survives the toggle cycle — 98.47% preserved
+```
+
+All 12 checks pass in `node test/roundtrip.test.mjs`, which now also extracts and exercises the real `binPixelsToHeightmap` from `index.html`. The full cycle costs only ~0.05% more than the one-way roundtrip (1.53% vs 1.48%) — the rebinning step is essentially lossless thanks to the snapped palette.
+
+Try it in the preview: load the spiral example in Reverse, then just click the toggle back and forth — the spiral persists through every cycle.
