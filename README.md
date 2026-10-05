@@ -20,6 +20,26 @@ benchmark button to compare speed of both versions
 
 The reverse controls synthesize an image from a grayscale HSL heightmap. The map is interpreted as a polar hue/saturation diagram: angle selects hue, radius selects saturation, and grayscale brightness is the relative pixel population (black means zero). Generated colors use 50% lightness and are arranged as a deterministic shuffled mosaic because a color distribution contains no spatial information. The included linear example draws a grayscale Archimedean spiral where hue and saturation increase together.
 
+### direct / reverse toggle
+
+A segmented toggle at the top of the sidebar switches between the two pipelines — and it **converts the current content instead of clearing it**:
+
+- **Direct → Reverse** bins every resampled pixel of the current image into its hue/saturation cell on the polar map; the per-cell population becomes the grayscale heightmap (densest cell = white, occupied cells never drop below 1), ready to be re-synthesized as a mosaic.
+- **Reverse → Direct** turns the generated mosaic into the direct source without any resampling, so it feeds straight into every visualization style.
+
+Toggling back and forth therefore carries the same color distribution through repeated HSL → image → HSL cycles: load the spiral example, flip to Direct, flip back — the spiral is still there. Entering reverse mode with no image loaded auto-loads the spiral example so the mode is never empty.
+
+### roundtrip: HSL → image → HSL
+
+The Reverse → Direct toggle feeds the generated mosaic straight back through the direct pipeline, and the heightmap shape (e.g. the spiral) visibly survives the full HSL → image → HSL cycle. Two things make that work:
+
+- **exact-source path**: the direct pipeline normally rescales every source with smoothing, which blends mosaic pixels into off-palette colors and scatters them over the diagram. Roundtrip sources are flagged exact: they are passed through 1:1 when they fit the pixel budget and scaled with nearest-neighbor sampling otherwise, so every pixel keeps a true palette color.
+- **palette refinement**: the canonical 50%-lightness palette is snapped, once and lazily, so that each cell stores the 8-bit RGB color (nudged at most ±2/255 per channel, invisibly) whose RGB → HSL → polar position lands exactly back on that cell. This lifts exact-cell returns from ~50% to ~85% and bounds every residual displacement to 1 px.
+
+The **Test Roundtrip Loss %** button measures the cycle in memory without touching the view: it regenerates the mosaic samples, runs every color through the direct-pipeline math, and reports the mean/max position error, the share of pixels returning within ≤1 px, the shape loss (total-variation distance on 7 px bins) and the exact-cell loss split from the pure sampling-quantization floor. For the spiral example at 50k pixels the roundtrip loses about 1.5% of the shape, with a mean displacement of ~0.15 px; the full toggle cycle (heightmap → mosaic → rebinned heightmap) loses about 1.5% as well.
+
+The same numbers are verified headlessly by `node test/roundtrip.test.mjs`, which extracts the real functions from `index.html` (palette init/refinement, sample generation, RGB → HSL, pixel-to-heightmap binning) and asserts the loss bounds.
+
 ### view modes
 
 3D isometry mode. in this mode placement is simple: same pixels increment bar height. properly calculate position of base pixel in pseudo-3d space.

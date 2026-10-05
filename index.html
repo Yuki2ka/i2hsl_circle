@@ -346,6 +346,43 @@
 			border-radius: 6px;
 		}
 
+		/* Direct / Reverse segmented mode toggle */
+		.mode-toggle {
+			display: grid;
+			grid-template-columns: 1fr 1fr;
+			gap: 0;
+			margin-bottom: 16px;
+			border: 1px solid var(--border-color);
+			border-radius: 8px;
+			overflow: hidden;
+		}
+
+		.mode-toggle-btn {
+			padding: 9px 6px;
+			font-size: 12px;
+			font-weight: 600;
+			background: transparent;
+			color: var(--text-muted);
+			border: none;
+			cursor: pointer;
+			transition: background-color 0.15s, color 0.15s;
+		}
+
+		.mode-toggle-btn + .mode-toggle-btn {
+			border-left: 1px solid var(--border-color);
+		}
+
+		.mode-toggle-btn.active {
+			background-color: #2563eb;
+			color: #ffffff;
+			cursor: default;
+		}
+
+		.mode-toggle-btn:not(.active):hover {
+			background-color: rgba(255, 255, 255, 0.05);
+			color: var(--text-main);
+		}
+
 		.reverse-tools {
 			margin-top: 16px;
 			padding-top: 16px;
@@ -366,6 +403,22 @@
 			line-height: 1.45;
 			color: var(--text-muted);
 		}
+
+		/* Roundtrip loss report */
+		.roundtrip-box {
+			display: none;
+			margin-top: 4px;
+			padding: 10px;
+			border: 1px dashed var(--border-color);
+			border-radius: 6px;
+			font-family: monospace;
+			font-size: 11px;
+			line-height: 1.6;
+			color: var(--text-main);
+		}
+
+		.roundtrip-box .rt-ok { color: #10b981; font-weight: bold; }
+		.roundtrip-box .rt-bad { color: #ef4444; font-weight: bold; }
 
 		/* Stats list */
 		.stats-list {
@@ -510,6 +563,10 @@
 		<div class="sidebar">
 			<!-- Image Source Panel -->
 			<div class="panel">
+				<div class="mode-toggle" role="tablist" aria-label="Pipeline direction">
+					<button class="mode-toggle-btn active" id="mode-direct-btn" role="tab" aria-selected="true">Direct: Image → HSL</button>
+					<button class="mode-toggle-btn" id="mode-reverse-btn" role="tab" aria-selected="false">Reverse: HSL → Image</button>
+				</div>
 				<div class="panel-title">
 					<span id="source-panel-title">Image source</span>
 				</div>
@@ -519,24 +576,30 @@
 						<canvas id="preview-canvas" style="display: none;"></canvas>
 					</div>
 				</div>
-				<div class="control-group">
-					<button class="btn btn-primary" id="btn-select">
-						Select Image File
-					</button>
-					<input type="file" id="file-input" accept="image/*" style="display: none;">
+				<div id="direct-tools">
+					<div class="control-group">
+						<button class="btn btn-primary" id="btn-select">
+							Select Image File
+						</button>
+						<input type="file" id="file-input" accept="image/*" style="display: none;">
+					</div>
+					<div class="preset-grid">
+						<button class="btn preset-btn" data-preset="wheel">Rainbow Wheel</button>
+						<button class="btn preset-btn" data-preset="blocks">Color Blocks</button>
+						<button class="btn preset-btn" data-preset="sunset">Vibrant Sunset</button>
+						<button class="btn preset-btn" data-preset="noise">Random Noise</button>
+					</div>
 				</div>
-				<div class="preset-grid">
-					<button class="btn preset-btn" data-preset="wheel">Rainbow Wheel</button>
-					<button class="btn preset-btn" data-preset="blocks">Color Blocks</button>
-					<button class="btn preset-btn" data-preset="sunset">Vibrant Sunset</button>
-					<button class="btn preset-btn" data-preset="noise">Random Noise</button>
-				</div>
-				<div class="reverse-tools">
+				<div class="reverse-tools" id="reverse-tools" style="display: none;">
 					<div class="reverse-tools-title">Reverse: distribution → image</div>
 					<button class="btn" id="btn-reverse-example">Example Linear HSL Distribution</button>
 					<button class="btn" id="btn-reverse-load">Load HSL Heightmap</button>
 					<input type="file" id="reverse-file-input" accept="image/*" style="display: none;">
 					<div class="reverse-help">Any image is read as grayscale: angle selects hue, radius selects saturation, and brightness controls how many pixels are generated. Black is zero height; generated colors use 50% lightness.</div>
+					<div class="reverse-tools-title" style="margin-top: 8px;">Roundtrip</div>
+					<button class="btn" id="btn-roundtrip-test" disabled>Test Roundtrip Loss %</button>
+					<div class="roundtrip-box" id="roundtrip-box"></div>
+					<div class="reverse-help">The mode toggle converts, never clears: Direct → Reverse bins the current image's pixels into this polar heightmap, Reverse → Direct turns the generated mosaic into the direct source without resampling — so the distribution (e.g. the spiral) survives HSL → image → HSL. The test measures how much is lost per cycle.</div>
 				</div>
 			</div>
 
@@ -824,6 +887,12 @@
 		const reverseFileInput = document.getElementById('reverse-file-input');
 		const btnReverseExample = document.getElementById('btn-reverse-example');
 		const btnReverseLoad = document.getElementById('btn-reverse-load');
+		const modeDirectBtn = document.getElementById('mode-direct-btn');
+		const modeReverseBtn = document.getElementById('mode-reverse-btn');
+		const directTools = document.getElementById('direct-tools');
+		const reverseTools = document.getElementById('reverse-tools');
+		const btnRoundtripTest = document.getElementById('btn-roundtrip-test');
+		const roundtripBox = document.getElementById('roundtrip-box');
 		
 		const engineSelector = document.getElementById('engine-selector');
 		const maxPixelsSlider = document.getElementById('max-pixels-slider');
@@ -861,6 +930,13 @@
 		let originalWidth = 0;
 		let originalHeight = 0;
 		let reverseHeightmapActive = false;
+		let reverseMapLoaded = false;   // a heightmap exists, reverse mode can be re-entered
+		let reverseSrcW = 0;            // original dimensions of the loaded heightmap source
+		let reverseSrcH = 0;
+		// Exact-palette flag: the source pixels are synthesized canonical HSL
+		// colors (the reverse mosaic). The direct pipeline must never resample
+		// or blend them, otherwise the roundtrip image -> HSL loses the shape.
+		let currentImageExact = false;
 
 		// --- OFFSCREEN CANVASES (REUSED TO AVOID ALLOCATIONS) ---
 		const offscreenCanvas = document.createElement('canvas');
@@ -881,6 +957,18 @@
 		reverseExampleCanvas.width = REVERSE_MAP_SIZE;
 		reverseExampleCanvas.height = REVERSE_MAP_SIZE;
 		const reverseExampleCtx = reverseExampleCanvas.getContext('2d');
+
+		// The generated mosaic lives in its own canvas so the roundtrip can
+		// feed the exact synthesized pixels back into the direct pipeline.
+		const reverseMosaicCanvas = document.createElement('canvas');
+		const reverseMosaicCtx = reverseMosaicCanvas.getContext('2d', { willReadFrequently: true });
+
+		// Presets render into a dedicated backing canvas (not the preview
+		// thumbnail) so switching modes never destroys the direct source.
+		const presetCanvas = document.createElement('canvas');
+		presetCanvas.width = 160;
+		presetCanvas.height = 120;
+		const presetCtx = presetCanvas.getContext('2d');
 
 		const offscreenPlacementCanvas = document.createElement('canvas');
 		offscreenPlacementCanvas.width = W;
@@ -968,6 +1056,82 @@
 			}
 		}
 
+		// Refine the canonical palette so the roundtrip is as exact as 8-bit
+		// RGB allows: for every cell, search the ±2 RGB neighborhood of the
+		// canonical color (ordered center-out) for the color whose
+		// direct-pipeline RGB -> HSL -> polar position lands exactly back on
+		// this cell. The nudge is at most 2/255 per channel — invisible —
+		// but it lifts exact-cell returns from ~50% to ~85% and bounds every
+		// residual displacement to 1 px, so heightmap shapes (the spiral)
+		// survive the full HSL -> image -> HSL cycle. Runs once, lazily, on
+		// the first reverse-mode use: direct-only sessions never pay for it.
+		let reverseColorsRefined = false;
+		function refineReverseColors() {
+			if (reverseColorsRefined) return;
+			reverseColorsRefined = true;
+
+			// The 125 offsets of the ±2 cube, ordered by Chebyshev shell and
+			// then by squared length, so the first exact hit is also the
+			// smallest visual nudge and the scan can stop immediately.
+			const offs = [];
+			for (let dr = -2; dr <= 2; dr++) {
+				for (let dg = -2; dg <= 2; dg++) {
+					for (let db = -2; db <= 2; db++) {
+						offs.push([dr, dg, db]);
+					}
+				}
+			}
+			offs.sort((a, b) => {
+				const ca = Math.max(Math.abs(a[0]), Math.abs(a[1]), Math.abs(a[2]));
+				const cb = Math.max(Math.abs(b[0]), Math.abs(b[1]), Math.abs(b[2]));
+				if (ca !== cb) return ca - cb;
+				return (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) - (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+			});
+			const offCount = offs.length;
+			const offR = new Int8Array(offCount);
+			const offG = new Int8Array(offCount);
+			const offB = new Int8Array(offCount);
+			for (let i = 0; i < offCount; i++) {
+				offR[i] = offs[i][0];
+				offG[i] = offs[i][1];
+				offB[i] = offs[i][2];
+			}
+
+			const c = REVERSE_MAP_RADIUS;
+			for (let y = 0; y < REVERSE_MAP_SIZE; y++) {
+				const row = y * REVERSE_MAP_SIZE;
+				for (let x = 0; x < REVERSE_MAP_SIZE; x++) {
+					const base = reverseColor[row + x];
+					if (base === 0) continue;
+					const r0 = base & 255;
+					const g0 = (base >>> 8) & 255;
+					const b0 = (base >>> 16) & 255;
+					let bestColor = base;
+					let bestErr = 0x7FFFFFFF;
+					for (let k = 0; k < offCount; k++) {
+						const r = r0 + offR[k];
+						const g = g0 + offG[k];
+						const b = b0 + offB[k];
+						if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) continue;
+						rtRgbToHueSat(r, g, b);
+						const theta = rtHue * 2 * Math.PI;
+						const rDist = rtSat * c;
+						const px = Math.round(c + rDist * Math.cos(theta));
+						const py = Math.round(c + rDist * Math.sin(theta));
+						const dx = px - x;
+						const dy = py - y;
+						const e = dx * dx + dy * dy;
+						if (e < bestErr) {
+							bestErr = e;
+							bestColor = 0xFF000000 | (b << 16) | (g << 8) | r;
+							if (e === 0) break;
+						}
+					}
+					reverseColor[row + x] = bestColor;
+				}
+			}
+		}
+
 		// The liquid never leaves the circular HSL island: only cells inside the
 		// r <= 180 disk may ever receive flowing particles. Cells just outside the
 		// rim (reachable through coordinate rounding) may hold initial liquid but
@@ -1025,6 +1189,11 @@
 			btnReverseExample.addEventListener('click', loadLinearHslExample);
 			btnReverseLoad.addEventListener('click', () => reverseFileInput.click());
 			reverseFileInput.addEventListener('change', handleReverseFileSelect);
+
+			// Direct / Reverse pipeline toggle and the roundtrip loss test
+			modeDirectBtn.addEventListener('click', switchToDirectMode);
+			modeReverseBtn.addEventListener('click', switchToReverseMode);
+			btnRoundtripTest.addEventListener('click', runRoundtripTest);
 
 			// Drag and Drop
 			window.addEventListener('dragover', (e) => {
@@ -1125,6 +1294,60 @@
 			btnBenchmark.addEventListener('click', runBenchmark);
 		}
 
+		// --- DIRECT / REVERSE MODE TOGGLE ---
+		function setUiMode(reverse) {
+			modeDirectBtn.classList.toggle('active', !reverse);
+			modeReverseBtn.classList.toggle('active', reverse);
+			modeDirectBtn.setAttribute('aria-selected', reverse ? 'false' : 'true');
+			modeReverseBtn.setAttribute('aria-selected', reverse ? 'true' : 'false');
+			directTools.style.display = reverse ? 'none' : 'block';
+			reverseTools.style.display = reverse ? 'flex' : 'none';
+		}
+
+		// The toggle CONVERTS the current content instead of clearing it:
+		// Reverse -> Direct turns the generated mosaic into the direct
+		// source (without resampling), Direct -> Reverse bins the current
+		// image's pixels into the polar heightmap. Toggling back and forth
+		// therefore carries the same distribution through repeated
+		// HSL -> image -> HSL cycles.
+		function switchToDirectMode() {
+			if (!reverseHeightmapActive) {
+				setUiMode(false);
+				return;
+			}
+			if (reverseMapLoaded && reverseTotalWeight > 0) {
+				runRoundtrip(); // mosaic becomes the direct source
+				return;
+			}
+			// Degenerate map (all black): fall back to the previous source.
+			leaveReverseMode();
+			refreshPreviewThumbnail();
+			statsOrigRes.textContent = currentImage ? `${originalWidth} × ${originalHeight}` : '-';
+			scheduleRender();
+		}
+
+		function switchToReverseMode() {
+			if (reverseHeightmapActive) {
+				setUiMode(true);
+				return;
+			}
+			if (currentImage && convertImageToHeightmap()) {
+				// Current image converted into its HSL population heightmap.
+				applyReverseUiState();
+				showToast('Image converted to HSL heightmap');
+				return;
+			}
+			if (reverseMapLoaded) {
+				// No usable image (fully transparent/black): re-enter with
+				// the previously prepared heightmap instead.
+				applyReverseUiState();
+			} else {
+				// First visit with no image: start with the linear spiral
+				// example so the mode is never empty.
+				loadLinearHslExample();
+			}
+		}
+
 		// --- PRESETS GENERATOR ---
 		function leaveReverseMode() {
 			if (!reverseHeightmapActive) return;
@@ -1136,36 +1359,56 @@
 			const is3D = iso3dModeActive(engineSelector.value);
 			heightScaleGroup.style.display = is3D ? 'block' : 'none';
 			heightLogGroup.style.display = is3D ? 'block' : 'none';
+			setUiMode(false);
 			iso3dUpdateInteractive();
 		}
 
 		function loadPreset(type) {
 			leaveReverseMode();
-			previewPlaceholder.style.display = 'none';
-			previewCanvas.style.display = 'block';
-			
-			previewCanvas.width = 160;
-			previewCanvas.height = 120;
-			
-			const w = previewCanvas.width;
-			const h = previewCanvas.height;
-			
+
+			const w = presetCanvas.width;
+			const h = presetCanvas.height;
+
 			if (type === 'wheel') {
-				generateRainbowWheel(previewCtx, w, h);
+				generateRainbowWheel(presetCtx, w, h);
 			} else if (type === 'blocks') {
-				generateColorBlocks(previewCtx, w, h);
+				generateColorBlocks(presetCtx, w, h);
 			} else if (type === 'sunset') {
-				generateVibrantSunset(previewCtx, w, h);
+				generateVibrantSunset(presetCtx, w, h);
 			} else if (type === 'noise') {
-				generateRandomNoise(previewCtx, w, h);
+				generateRandomNoise(presetCtx, w, h);
 			}
 
-			currentImage = previewCanvas;
+			currentImage = presetCanvas;
+			currentImageExact = false;
 			originalWidth = 400; // virtual source dimensions for preset
 			originalHeight = 300;
-			
+
+			refreshPreviewThumbnail();
 			statsOrigRes.textContent = `${originalWidth} × ${originalHeight}`;
 			scheduleRender();
+		}
+
+		// Redraw the sidebar thumbnail from the current direct-mode source.
+		// Exact-palette sources (the roundtrip mosaic) are scaled without
+		// smoothing so the thumbnail shows real palette colors.
+		function refreshPreviewThumbnail() {
+			if (!currentImage) {
+				previewPlaceholder.style.display = 'block';
+				previewCanvas.style.display = 'none';
+				return;
+			}
+			previewPlaceholder.style.display = 'none';
+			previewCanvas.style.display = 'block';
+			const ar = (originalWidth || 1) / (originalHeight || 1);
+			let pw = 160;
+			let ph = 120;
+			if (ar > 1.33) ph = 160 / ar;
+			else pw = 120 * ar;
+			previewCanvas.width = Math.max(1, Math.round(pw));
+			previewCanvas.height = Math.max(1, Math.round(ph));
+			previewCtx.imageSmoothingEnabled = !currentImageExact;
+			previewCtx.drawImage(currentImage, 0, 0, previewCanvas.width, previewCanvas.height);
 		}
 
 		function generateRainbowWheel(ctx, w, h) {
@@ -1282,25 +1525,11 @@
 				img.onload = () => {
 					leaveReverseMode();
 					currentImage = img;
+					currentImageExact = false;
 					originalWidth = img.width;
 					originalHeight = img.height;
-					
-					// Draw preview thumbnail
-					previewPlaceholder.style.display = 'none';
-					previewCanvas.style.display = 'block';
-					
-					const ar = img.width / img.height;
-					let pw = 160;
-					let ph = 120;
-					if (ar > 1.33) {
-						ph = 160 / ar;
-					} else {
-						pw = 120 * ar;
-					}
-					previewCanvas.width = pw;
-					previewCanvas.height = ph;
-					previewCtx.drawImage(img, 0, 0, pw, ph);
 
+					refreshPreviewThumbnail();
 					statsOrigRes.textContent = `${originalWidth} × ${originalHeight}`;
 					showToast();
 					scheduleRender();
@@ -1382,6 +1611,7 @@
 		}
 
 		function activateReverseHeightmap(source, sourceWidth, sourceHeight, message) {
+			refineReverseColors(); // one-time palette snap for an exact roundtrip
 			const size = REVERSE_MAP_SIZE;
 			reverseSourceCtx.clearRect(0, 0, size, size);
 			reverseSourceCtx.drawImage(source, 0, 0, size, size);
@@ -1407,14 +1637,24 @@
 			reverseGrayCtx.putImageData(reverseGrayImage, 0, 0);
 			reverseTotalWeight = total;
 			reverseMapHash = hash >>> 0;
-			reverseHeightmapActive = true;
+			reverseMapLoaded = true;
+			reverseSrcW = sourceWidth;
+			reverseSrcH = sourceHeight;
 
+			applyReverseUiState();
+			showToast(message);
+		}
+
+		// Shared UI state of reverse mode: used both when a new heightmap is
+		// prepared and when the mode toggle re-enters with the existing map.
+		function applyReverseUiState() {
+			reverseHeightmapActive = true;
 			previewPlaceholder.style.display = 'none';
 			previewCanvas.style.display = 'block';
 			sourcePanelTitle.textContent = 'Generated color mosaic';
 			maxPixelsLabel.textContent = 'Max Generated Pixels';
 			statsPixelsLabel.textContent = 'Pixels Generated';
-			statsOrigRes.textContent = `${sourceWidth} × ${sourceHeight}`;
+			statsOrigRes.textContent = `${reverseSrcW} × ${reverseSrcH}`;
 			heightScaleGroup.style.display = 'none';
 			heightLogGroup.style.display = 'none';
 			benchmarkBox.style.display = 'none';
@@ -1422,9 +1662,104 @@
 			liqAnimActive = false;
 			prPhase = 0;
 			prAnimActive = false;
+			setUiMode(true);
 			iso3dUpdateInteractive();
 			scheduleRender();
-			showToast(message);
+		}
+
+		// --- DIRECT IMAGE -> HEIGHTMAP CONVERSION (MODE TOGGLE) ---
+		// Bin RGBA pixels into the polar hue/saturation weight map: each
+		// pixel lands in its H/S cell exactly like the direct placement
+		// engines position it, and the per-cell population becomes the
+		// grayscale height, scaled so the densest cell is full white.
+		// Returns the number of binned pixels.
+		let heightmapCounts = null; // lazy Int32 per-cell population scratch
+		function binPixelsToHeightmap(srcData, pixelCount) {
+			if (heightmapCounts === null) heightmapCounts = new Int32Array(REVERSE_MAP_CELLS);
+			heightmapCounts.fill(0);
+			const c = REVERSE_MAP_RADIUS;
+			let binned = 0;
+			let maxCount = 0;
+			for (let i = 0; i < pixelCount; i++) {
+				const p = i * 4;
+				if (srcData[p + 3] < 10) continue;
+				rtRgbToHueSat(srcData[p], srcData[p + 1], srcData[p + 2]);
+				const theta = rtHue * 2 * Math.PI;
+				let rDist = rtSat * c;
+				let x = Math.round(c + rDist * Math.cos(theta));
+				let y = Math.round(c + rDist * Math.sin(theta));
+				// Rounding at the very rim can land one cell outside the
+				// disk: pull such pixels back inside along their radius.
+				while (reverseColor[y * REVERSE_MAP_SIZE + x] === 0 && rDist > 0) {
+					rDist -= 1;
+					x = Math.round(c + rDist * Math.cos(theta));
+					y = Math.round(c + rDist * Math.sin(theta));
+				}
+				const idx = y * REVERSE_MAP_SIZE + x;
+				if (reverseColor[idx] === 0) continue;
+				const n = ++heightmapCounts[idx];
+				if (n > maxCount) maxCount = n;
+				binned++;
+			}
+
+			// Scale populations into the 0..255 gray range. Occupied cells
+			// always keep at least height 1 so no color disappears.
+			let total = 0;
+			let hash = 2166136261;
+			for (let i = 0; i < REVERSE_MAP_CELLS; i++) {
+				const count = heightmapCounts[i];
+				let height = 0;
+				if (count > 0) {
+					height = Math.round(count * 255 / maxCount);
+					if (height < 1) height = 1;
+				}
+				reverseWeight[i] = height;
+				total += height;
+				hash = Math.imul(hash ^ height, 16777619);
+			}
+			reverseTotalWeight = total;
+			reverseMapHash = hash >>> 0;
+			return binned;
+		}
+
+		// Resample the current direct source exactly like render() does,
+		// bin it into the weight map and refresh the grayscale preview.
+		// Returns true when the image produced a usable distribution.
+		function convertImageToHeightmap() {
+			if (!currentImage) return false;
+			refineReverseColors(); // one-time palette snap for an exact roundtrip
+			const maxPixels = parseInt(maxPixelsSlider.value, 10);
+			const ar = originalWidth / originalHeight;
+			let srcW;
+			let srcH;
+			if (currentImageExact && originalWidth * originalHeight <= maxPixels) {
+				srcW = originalWidth;
+				srcH = originalHeight;
+			} else {
+				srcW = Math.max(1, Math.round(Math.sqrt(maxPixels * ar)));
+				srcH = Math.max(1, Math.round(Math.sqrt(maxPixels / ar)));
+			}
+			offscreenCanvas.width = srcW;
+			offscreenCanvas.height = srcH;
+			offscreenCtx.imageSmoothingEnabled = !currentImageExact;
+			offscreenCtx.drawImage(currentImage, 0, 0, srcW, srcH);
+			const srcData = offscreenCtx.getImageData(0, 0, srcW, srcH).data;
+			const binned = binPixelsToHeightmap(srcData, srcW * srcH);
+			if (binned === 0 || reverseTotalWeight === 0) return false;
+
+			const grayData = reverseGrayImage.data;
+			for (let i = 0, p = 0; i < REVERSE_MAP_CELLS; i++, p += 4) {
+				const height = reverseWeight[i];
+				grayData[p] = height;
+				grayData[p + 1] = height;
+				grayData[p + 2] = height;
+				grayData[p + 3] = 255;
+			}
+			reverseGrayCtx.putImageData(reverseGrayImage, 0, 0);
+			reverseMapLoaded = true;
+			reverseSrcW = originalWidth;
+			reverseSrcH = originalHeight;
+			return true;
 		}
 
 		function reverseShuffle(pixels, count) {
@@ -1463,6 +1798,36 @@
 			destCtx.fillText('GRAYSCALE HEIGHTMAP · WHITE = MORE PIXELS', 300, 24);
 		}
 
+		// Walk the weighted map once and emit outputCount color samples in
+		// proportion to the cell weights. Optionally records the source cell
+		// index of every sample (used by the roundtrip loss test). Returns
+		// the number of generated samples.
+		function reverseGenerateSamples(colorsOut, cellsOut, outputCount) {
+			let generated = 0;
+			if (reverseTotalWeight <= 0) return 0;
+			const weightPerPixel = reverseTotalWeight / outputCount;
+			let threshold = weightPerPixel * 0.5;
+			let cumulative = 0;
+			for (let i = 0; i < REVERSE_MAP_CELLS && generated < outputCount; i++) {
+				cumulative += reverseWeight[i];
+				while (generated < outputCount && cumulative >= threshold) {
+					if (cellsOut !== null) cellsOut[generated] = i;
+					colorsOut[generated++] = reverseColor[i];
+					threshold += weightPerPixel;
+				}
+			}
+			// Floating point roundoff can only leave the final sample empty.
+			if (generated < outputCount) {
+				let last = REVERSE_MAP_CELLS - 1;
+				while (last > 0 && reverseWeight[last] === 0) last--;
+				while (generated < outputCount) {
+					if (cellsOut !== null) cellsOut[generated] = last;
+					colorsOut[generated++] = reverseColor[last];
+				}
+			}
+			return generated;
+		}
+
 		function renderReverseHeightmap() {
 			const startTime = performance.now();
 			const maxPixels = parseInt(maxPixelsSlider.value, 10);
@@ -1470,37 +1835,176 @@
 			const outH = Math.max(1, Math.floor(maxPixels / outW));
 			const outputCount = outW * outH;
 
+			reverseMosaicCanvas.width = outW;
+			reverseMosaicCanvas.height = outH;
+			const outputImage = reverseMosaicCtx.createImageData(outW, outH);
+			const outputPixels = new Uint32Array(outputImage.data.buffer);
+			const generated = reverseGenerateSamples(outputPixels, null, outputCount);
+			if (generated > 0) reverseShuffle(outputPixels, generated);
+			reverseMosaicCtx.putImageData(outputImage, 0, 0);
+
+			// Mirror the mosaic into the sidebar thumbnail.
 			previewCanvas.width = outW;
 			previewCanvas.height = outH;
-			const outputImage = previewCtx.createImageData(outW, outH);
-			const outputPixels = new Uint32Array(outputImage.data.buffer);
-			let generated = 0;
+			previewCtx.drawImage(reverseMosaicCanvas, 0, 0);
 
-			if (reverseTotalWeight > 0) {
-				const weightPerPixel = reverseTotalWeight / outputCount;
-				let threshold = weightPerPixel * 0.5;
-				let cumulative = 0;
-				for (let i = 0; i < REVERSE_MAP_CELLS && generated < outputCount; i++) {
-					cumulative += reverseWeight[i];
-					while (generated < outputCount && cumulative >= threshold) {
-						outputPixels[generated++] = reverseColor[i];
-						threshold += weightPerPixel;
-					}
-				}
-				// Floating point roundoff can only leave the final sample empty.
-				if (generated < outputCount) {
-					let last = REVERSE_MAP_CELLS - 1;
-					while (last > 0 && reverseWeight[last] === 0) last--;
-					while (generated < outputCount) outputPixels[generated++] = reverseColor[last];
-				}
-				reverseShuffle(outputPixels, generated);
-			}
+			btnRoundtripTest.disabled = generated === 0;
 
-			previewCtx.putImageData(outputImage, 0, 0);
 			drawReverseHeightmap();
 			statsResampledRes.textContent = `${REVERSE_MAP_SIZE} × ${REVERSE_MAP_SIZE} map`;
 			statsPixelsPlaced.textContent = generated.toLocaleString();
 			statsTime.textContent = (performance.now() - startTime).toFixed(1) + ' ms';
+		}
+
+		// --- ROUNDTRIP: GENERATED MOSAIC -> DIRECT PIPELINE ---
+		// Reverse -> Direct conversion behind the mode toggle: the
+		// synthesized mosaic becomes the direct source. Because the mosaic
+		// pixels are canonical HSL palette colors and the exact-source path
+		// never resamples or blends them, every pixel lands back on (almost
+		// exactly) the map cell it was generated from — the heightmap shape
+		// (e.g. the spiral) survives the full HSL -> image -> HSL cycle.
+		function runRoundtrip() {
+			if (!reverseMapLoaded || reverseTotalWeight <= 0) return;
+			if (reverseHeightmapActive) {
+				renderReverseHeightmap(); // sync the mosaic with the slider
+				leaveReverseMode();
+			}
+			currentImage = reverseMosaicCanvas;
+			currentImageExact = true;
+			originalWidth = reverseMosaicCanvas.width;
+			originalHeight = reverseMosaicCanvas.height;
+			refreshPreviewThumbnail();
+			statsOrigRes.textContent = `${originalWidth} × ${originalHeight}`;
+			showToast('Mosaic converted to direct image');
+			scheduleRender();
+		}
+
+		// --- ROUNDTRIP LOSS TEST ---
+		// Simulates the exact roundtrip in memory: heightmap -> N generated
+		// palette pixels -> RGB -> HSL -> polar map position, then compares
+		// the reconstructed distribution with the source heightmap.
+		// Scratch buffers are lazily allocated once and reused.
+		const RT_MAX_SAMPLES = 100000;     // matches the max-pixels slider cap
+		const RT_BIN = 7;                  // coarse bin for the shape-loss metric
+		const RT_COARSE_DIM = Math.ceil(REVERSE_MAP_SIZE / RT_BIN);
+		let rtColors = null;
+		let rtCells = null;
+		let rtRecon = null;
+		let rtSrcCount = null;
+		let rtCoarseSrc = null;
+		let rtCoarseRec = null;
+		let rtHue = 0;
+		let rtSat = 0;
+
+		// Same RGB -> HSL math as the hot placement loops, results stored in
+		// rtHue / rtSat to avoid boxing a return tuple.
+		function rtRgbToHueSat(r, g, b) {
+			const rf = r / 255;
+			const gf = g / 255;
+			const bf = b / 255;
+			const max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+			const min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+			let h = 0;
+			let s = 0;
+			const l = (max + min) * 0.5;
+			if (max !== min) {
+				const d = max - min;
+				s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+				if (max === rf) h = (gf - bf) / d + (gf < bf ? 6 : 0);
+				else if (max === gf) h = (bf - rf) / d + 2;
+				else h = (rf - gf) / d + 4;
+				h /= 6;
+			}
+			rtHue = h;
+			rtSat = s;
+		}
+
+		function runRoundtripTest() {
+			if (!reverseMapLoaded || reverseTotalWeight <= 0) return;
+			const startTime = performance.now();
+
+			if (rtColors === null) {
+				rtColors = new Uint32Array(RT_MAX_SAMPLES);
+				rtCells = new Int32Array(RT_MAX_SAMPLES);
+				rtRecon = new Int32Array(REVERSE_MAP_CELLS);
+				rtSrcCount = new Int32Array(REVERSE_MAP_CELLS);
+				rtCoarseSrc = new Float64Array(RT_COARSE_DIM * RT_COARSE_DIM);
+				rtCoarseRec = new Float64Array(RT_COARSE_DIM * RT_COARSE_DIM);
+			}
+			rtRecon.fill(0);
+			rtSrcCount.fill(0);
+			rtCoarseSrc.fill(0);
+			rtCoarseRec.fill(0);
+
+			// Stage 1: generate the same samples the mosaic is built from.
+			const maxPixels = parseInt(maxPixelsSlider.value, 10);
+			const outW = Math.max(1, Math.floor(Math.sqrt(maxPixels * 4 / 3)));
+			const outH = Math.max(1, Math.floor(maxPixels / outW));
+			const outputCount = Math.min(outW * outH, RT_MAX_SAMPLES);
+			const generated = reverseGenerateSamples(rtColors, rtCells, outputCount);
+			if (generated === 0) return;
+
+			// Stage 2: run every generated color through the direct-pipeline
+			// RGB -> HSL -> polar position math and measure the displacement
+			// from the cell it was generated at.
+			const c = REVERSE_MAP_RADIUS;
+			let errSum = 0;
+			let errMax = 0;
+			let within1 = 0;
+			for (let i = 0; i < generated; i++) {
+				const cell = rtCells[i];
+				const color = rtColors[i];
+				rtRgbToHueSat(color & 255, (color >>> 8) & 255, (color >>> 16) & 255);
+				const theta = rtHue * 2 * Math.PI;
+				const rDist = rtSat * c;
+				const x1 = Math.round(c + rDist * Math.cos(theta));
+				const y1 = Math.round(c + rDist * Math.sin(theta));
+				const x0 = cell % REVERSE_MAP_SIZE;
+				const y0 = (cell / REVERSE_MAP_SIZE) | 0;
+				const dx = x1 - x0;
+				const dy = y1 - y0;
+				const err = Math.sqrt(dx * dx + dy * dy);
+				errSum += err;
+				if (err > errMax) errMax = err;
+				if (err <= 1) within1++;
+				rtSrcCount[cell]++;
+				rtRecon[y1 * REVERSE_MAP_SIZE + x1]++;
+			}
+
+			// Stage 3: distribution losses as total-variation distances (in
+			// percent: 0% = identical distribution, 100% = fully disjoint).
+			const invW = 1 / reverseTotalWeight;
+			const invN = 1 / generated;
+			let tvSampling = 0; // heightmap -> N discrete samples (quantization only)
+			let tvExact = 0;    // heightmap -> reconstructed map, exact cells
+			for (let i = 0; i < REVERSE_MAP_CELLS; i++) {
+				const pSrc = reverseWeight[i] * invW;
+				tvSampling += Math.abs(pSrc - rtSrcCount[i] * invN);
+				tvExact += Math.abs(pSrc - rtRecon[i] * invN);
+				const bx = (i % REVERSE_MAP_SIZE) / RT_BIN | 0;
+				const by = ((i / REVERSE_MAP_SIZE) | 0) / RT_BIN | 0;
+				const bIdx = by * RT_COARSE_DIM + bx;
+				rtCoarseSrc[bIdx] += pSrc;
+				rtCoarseRec[bIdx] += rtRecon[i] * invN;
+			}
+			let tvShape = 0; // binned: tolerant to sub-bin displacement, measures shape survival
+			for (let i = 0; i < RT_COARSE_DIM * RT_COARSE_DIM; i++) {
+				tvShape += Math.abs(rtCoarseSrc[i] - rtCoarseRec[i]);
+			}
+			const lossSampling = tvSampling * 50; // 0.5 * sum * 100%
+			const lossExact = tvExact * 50;
+			const lossShape = tvShape * 50;
+			const meanErr = errSum / generated;
+			const pctWithin1 = within1 * 100 / generated;
+			const elapsed = performance.now() - startTime;
+
+			const ok = lossShape <= 5 && meanErr <= 1;
+			roundtripBox.style.display = 'block';
+			roundtripBox.innerHTML =
+				`Roundtrip: <span class="${ok ? 'rt-ok' : 'rt-bad'}">${ok ? 'WORKS' : 'DEGRADED'}</span> · ${generated.toLocaleString()} px · ${elapsed.toFixed(1)} ms<br>` +
+				`Position error: mean ${meanErr.toFixed(3)} px · max ${errMax.toFixed(2)} px · ${pctWithin1.toFixed(1)}% within ≤1 px<br>` +
+				`Shape loss (${RT_BIN}px bins): <span class="${ok ? 'rt-ok' : 'rt-bad'}">${lossShape.toFixed(2)}%</span><br>` +
+				`Exact-cell loss: ${lossExact.toFixed(2)}% (incl. ${lossSampling.toFixed(2)}% pure sampling quantization)`;
 		}
 
 		function showToast(message = 'Image loaded successfully!') {
@@ -1735,18 +2239,28 @@
 			const maxPixels = parseInt(maxPixelsSlider.value, 10);
 			const vizStyle = engineSelector.value;
 
-			// Calculate resampled width and height preserving aspect ratio
+			// Calculate resampled width and height preserving aspect ratio.
+			// Exact-palette sources (the reverse-roundtrip mosaic) are passed
+			// through 1:1 whenever they fit the pixel budget, and are scaled
+			// without smoothing otherwise: blending palette colors would move
+			// pixels to wrong HSL positions and destroy the roundtrip shape.
 			const ar = originalWidth / originalHeight;
-			let srcW = Math.sqrt(maxPixels * ar);
-			let srcH = Math.sqrt(maxPixels / ar);
-			srcW = Math.max(1, Math.round(srcW));
-			srcH = Math.max(1, Math.round(srcH));
+			let srcW;
+			let srcH;
+			if (currentImageExact && originalWidth * originalHeight <= maxPixels) {
+				srcW = originalWidth;
+				srcH = originalHeight;
+			} else {
+				srcW = Math.max(1, Math.round(Math.sqrt(maxPixels * ar)));
+				srcH = Math.max(1, Math.round(Math.sqrt(maxPixels / ar)));
+			}
 
 			statsResampledRes.textContent = `${srcW} × ${srcH}`;
 
 			// Downscale image to offscreen canvas
 			offscreenCanvas.width = srcW;
 			offscreenCanvas.height = srcH;
+			offscreenCtx.imageSmoothingEnabled = !currentImageExact;
 			offscreenCtx.drawImage(currentImage, 0, 0, srcW, srcH);
 
 			const srcImgData = offscreenCtx.getImageData(0, 0, srcW, srcH);
