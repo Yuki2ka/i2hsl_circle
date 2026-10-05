@@ -1,0 +1,37 @@
+## Development Plan
+
+Based on the requirements in `doc/task9-reverse.txt`:
+
+1. **Bidirectional Conversion Architecture (Direct & Reverse)**:
+   - **Forward Mapping (Image → HSL)**: Converts pixel RGB colors $(r, g, b) \to (h, s, l)$ and maps them to circular island coordinates $(\theta = 2\pi h, r = s \cdot R_{\max})$.
+   - **Reverse Mapping (HSL Diagram / Heightmap → Image)**: Reads the HSL canvas or circular heightmap, derives $(h, s, l)$ from polar coordinates and luminance/mass, samples $N$ pixels proportionally, and synthesizes a spatially coherent image in the preview canvas.
+   - **Stable Non-Destructive GUI**: Both the input image canvas (`preview-canvas`) and the main HSL circular diagram (`hsl-canvas`) remain visible and update synchronously when toggling or converting back and forth.
+
+2. **HSL Presets & Greyscale Heightmap Loader**:
+   - **Example HSL Linearts**:
+     - *Spiral Lineart*: Archimedean spiral sweeping across all hue angles and radial saturation levels.
+     - *Radial Spokes*: 12 pure-hue radial spokes radiating from the center.
+     - *Concentric Rings*: Pure saturation levels (25%, 50%, 75%, 100%).
+     - *Flower Rose*: Harmonic polar curve $r(\theta) = R_{\max}(0.5 + 0.45\sin(6\theta))$.
+   - **Load HSL Image (Heightmap)**: File loader that imports any image, fits it onto the circular HSL island, converts pixel luminance to heightmap values, and renders it directly as the source distribution.
+
+3. **Roundtrip Loss & Fidelity Verification**:
+   - **Metric Computation**: Computes histogram Total Variation Loss % ($\text{TV Loss} = \frac{1}{2}\sum |P_{\text{orig}} - P_{\text{roundtrip}}| \times 100\%$), Color Fidelity %, and Color Error $\Delta E$.
+   - **Roundtrip Test Engine**: Executes full HSL ⇄ Image ⇄ HSL cycles and updates live stats. Geometric patterns (such as spiral lineart) remain intact across roundtrips.
+
+4. **Monte-Carlo Spatial Relaxation**:
+   - Asynchronous, frame-budgeted Monte-Carlo spatial Lloyd relaxation that iteratively swaps pixel positions to reduce spatial total variation and gradient roughness while strictly conserving 100% of the HSL color distribution.
+
+---
+
+## Implementation Summary
+
+All components specified in `doc/task9-reverse.txt` have been implemented in `index.html`:
+
+- **UI Controls & Panels**:
+  - **HSL Diagram & Lineart Panel**: Added file loader `Load HSL Image (Heightmap)` and 4 HSL lineart preset buttons (`Spiral Lineart`, `Radial Spokes`, `Concentric Rings`, `Flower Rose`).
+  - **Convert & Roundtrip Panel**: Added `⇄ Direct: Img → HSL`, `⇄ Reverse: HSL → Img`, `⟳ Test Roundtrip`, and `⚡ Optimize (MC)`.
+  - **Performance & Roundtrip Stats**: Real-time display for *Roundtrip TV Loss %*, *Color Fidelity %*, *Color Error $\Delta E$*, and *Roundtrip Cycle Time (ms)*.
+- **Reverse Synthesis Engine**: High-performance sampling from HSL polar coordinates with continuous serpentine 2D spatial arrangement.
+- **Roundtrip Testing & Loss Engine**: Bilinear smooth histogram binning and loss calculation.
+- **Monte-Carlo Optimization**: Fast candidate pixel-swapping relaxation loop running over animation frames.
