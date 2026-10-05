@@ -54,11 +54,20 @@ the visualizer supports two-way bidirectional mapping between images and circula
 3. **HSL Lineart & Greyscale Heightmap Sources**:
    - Built-in presets for clean geometric HSL linearts: Archimedean Spiral, 12-arm Radial Spokes, Concentric Saturation Rings, and Flower Rose curves.
    - "Load HSL Image (Heightmap)" imports any image directly onto the circular HSL disc as a grayscale heightmap.
+   - Every one of those buttons **runs the reverse conversion on click**, exactly the way the image presets run the direct conversion: one click updates the diagram and the synthesized image together. The `⇄ Reverse: HSL → Img` button stays for re-reading a diagram that the direct pipeline painted.
 4. **Roundtrip Loss & Fidelity Verification**:
-   - Tests HSL ⇄ Image roundtrips and computes Total Variation Loss %, Color Fidelity %, and Color Error $\Delta E$.
+   - Tests HSL ⇄ Image roundtrips and computes Total Variation Loss %, Color Fidelity %, Color Error $\Delta E$ and the mean/max **position error** of the cycle.
    - Geometric structures (e.g. spiral curves) are preserved across roundtrip cycles.
 5. **Monte-Carlo Spatial Lloyd Relaxation**:
    - Optimizes reconstructed image spatial coherence (smoothing gradients and eliminating noise) while conserving 100% of the HSL color distribution.
+
+three things keep the cycle lossless enough that the drawing itself survives:
+
+- **guide-free source**: the linearts and heightmaps are painted on a separate, transparent canvas and only composited over the diagram's coordinate guide for display. The reverse pass reads that clean copy, so the saturation rings and their labels — which are bright enough to pass for data and account for ~5% of a lineart's mass — never enter the distribution.
+- **palette snap**: 8-bit RGB cannot express every $(h, s)$ pair exactly, so an emitted color normally returns to a slightly different diagram pixel. Each color is searched over the $\pm 2$ RGB neighborhood (ordered center-out) for the variant whose RGB → HSL → polar position lands back on the pixel it came from. The nudge is at most $2/255$ per channel — invisible — and it takes the mean displacement from 0.53 px to 0.15 px, with 100% of pixels returning within 1 px (84.7% exactly).
+- **exact source path**: the mosaic is sized to the Max Pixels budget and flagged exact, so the direct pipeline passes it through 1:1 (and uses nearest-neighbor when the budget is lowered) instead of smoothing palette colors into neighbors that belong somewhere else on the disc.
+
+`node test/roundtrip.test.mjs` verifies this headlessly: it extracts the real `convertReverseHslToImage` and the snap helpers out of `index.html`, rasterizes the Spiral Lineart preset, and asserts the bounds. For the spiral at 50k pixels the shape loss (total variation on 7 px bins) is **2.2%**, down from 3.9% without the snap.
 
 ### web site
 

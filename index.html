@@ -346,6 +346,13 @@
 			border-radius: 6px;
 		}
 
+		.panel-hint {
+			font-size: 11px;
+			line-height: 1.5;
+			color: var(--text-muted);
+			margin-top: 8px;
+		}
+
 		.btn-convert {
 			background: linear-gradient(135deg, #6366f1, #4f46e5);
 			border-color: #6366f1;
@@ -588,6 +595,9 @@
 					<button class="btn hsl-preset-btn" data-hsl-preset="rings">Concentric Rings</button>
 					<button class="btn hsl-preset-btn" data-hsl-preset="flower">Flower Rose</button>
 				</div>
+				<div class="panel-hint">
+					Each example runs the reverse conversion on click — the diagram and its synthesized image update together, just like the image presets run the direct conversion.
+				</div>
 			</div>
 
 			<!-- Convert & Roundtrip Panel -->
@@ -699,6 +709,10 @@
 					<div class="stats-item">
 						<span class="stats-label">Color Error ΔE</span>
 						<span class="stats-val" id="stats-roundtrip-delta-e">-</span>
+					</div>
+					<div class="stats-item">
+						<span class="stats-label">Position Error</span>
+						<span class="stats-val" id="stats-roundtrip-pos" style="color: #f59e0b;">-</span>
 					</div>
 					<div class="stats-item">
 						<span class="stats-label">Roundtrip Cycle Time</span>
@@ -932,6 +946,7 @@
 		const statsRoundtripLoss = document.getElementById('stats-roundtrip-loss');
 		const statsRoundtripFidelity = document.getElementById('stats-roundtrip-fidelity');
 		const statsRoundtripDeltaE = document.getElementById('stats-roundtrip-delta-e');
+		const statsRoundtripPos = document.getElementById('stats-roundtrip-pos');
 		const statsRoundtripTime = document.getElementById('stats-roundtrip-time');
 
 		// Pre-allocated histogram configuration for roundtrip metrics
@@ -949,10 +964,42 @@
 		let currentImage = null; // Can be Image or Canvas (preset)
 		let originalWidth = 0;
 		let originalHeight = 0;
+		// Sources built out of exact HSL palette colors (the reverse mosaic)
+		// must never be smoothed or rescaled by the direct pipeline: blending
+		// two palette colors yields a third one that maps to a completely
+		// different place on the diagram and smears the distribution.
+		let currentImageExact = false;
 
 		// --- OFFSCREEN CANVASES (REUSED TO AVOID ALLOCATIONS) ---
 		const offscreenCanvas = document.createElement('canvas');
 		const offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+
+		// Guide-free copy of the HSL distribution painted by the lineart
+		// presets and the heightmap loader. The visible diagram also carries
+		// the saturation rings, hue spokes and their labels; those pixels are
+		// bright enough to be read back as data by the reverse pass (the 25%
+		// saturation ring alone is ~5% of a lineart's total mass), so reverse
+		// reads this canvas whenever it holds the active distribution.
+		const hslSourceCanvas = document.createElement('canvas');
+		hslSourceCanvas.width = W;
+		hslSourceCanvas.height = H;
+		const hslSourceCtx = hslSourceCanvas.getContext('2d', { willReadFrequently: true });
+		let hslSourceValid = false; // false once the direct pipeline repaints the diagram
+
+		// --- PRE-ALLOCATED REVERSE PASS BUFFERS (ZERO ALLOCATION PER RUN) ---
+		// One entry per lit diagram pixel inside the r <= 240 disk
+		// (pi * 240^2 ~= 180,956 lattice points, rounded up with headroom).
+		const REV_MAX_CELLS = 185000;
+		const revCellHue = new Float32Array(REV_MAX_CELLS);
+		const revCellSat = new Float32Array(REV_MAX_CELLS);
+		const revCellLight = new Float32Array(REV_MAX_CELLS);
+		const revCellWeight = new Float32Array(REV_MAX_CELLS);
+		const revCellSortKey = new Float32Array(REV_MAX_CELLS);
+		const revCellX = new Int16Array(REV_MAX_CELLS);
+		const revCellY = new Int16Array(REV_MAX_CELLS);
+		const revCellColor = new Uint32Array(REV_MAX_CELLS); // source color on the diagram
+		const revCellOrder = new Uint32Array(REV_MAX_CELLS);
+		const revPrefixWeight = new Float64Array(REV_MAX_CELLS);
 
 		const offscreenPlacementCanvas = document.createElement('canvas');
 		offscreenPlacementCanvas.width = W;
@@ -964,6 +1011,7 @@
 		// --- INITIALIZATION ---
 		function init() {
 			initSpiral();
+			initSnapOffsets();
 			initLiquidIsland();
 			iso3dSupported(); // probe once so the camera affordances know their fate
 			prHideIfUnsupported();
@@ -1071,10 +1119,11 @@
 				}
 			});
 
-			// Image Presets
+			// Image presets: loading one immediately runs the direct
+			// conversion (loadPreset -> scheduleRender).
 			document.querySelectorAll('.preset-btn').forEach(btn => {
 				btn.addEventListener('click', (e) => {
-					loadPreset(e.target.dataset.preset);
+					loadPreset(e.currentTarget.dataset.preset);
 				});
 			});
 
@@ -1082,10 +1131,12 @@
 			btnLoadHsl.addEventListener('click', () => hslFileInput.click());
 			hslFileInput.addEventListener('change', handleHslFileSelect);
 
-			// HSL Lineart Presets
+			// HSL lineart examples: symmetrically, loading one immediately
+			// runs the reverse conversion (loadHslPreset -> reverse pass),
+			// so a single click shows both the diagram and its image.
 			document.querySelectorAll('.hsl-preset-btn').forEach(btn => {
 				btn.addEventListener('click', (e) => {
-					loadHslPreset(e.target.dataset.hslPreset);
+					loadHslPreset(e.currentTarget.dataset.hslPreset);
 				});
 			});
 
@@ -1207,6 +1258,7 @@
 			}
 
 			currentImage = previewCanvas;
+			currentImageExact = false;
 			originalWidth = 400; // virtual source dimensions for preset
 			originalHeight = 300;
 			
@@ -1327,6 +1379,7 @@
 				const img = new Image();
 				img.onload = () => {
 					currentImage = img;
+					currentImageExact = false;
 					originalWidth = img.width;
 					originalHeight = img.height;
 					
@@ -1369,20 +1422,24 @@
 			}
 		}
 
+		// Lineart presets are painted on the transparent, guide-free source
+		// canvas and only then composited over the diagram's coordinate
+		// guide, so the reverse pass reads the distribution and nothing else.
 		function loadHslPreset(type) {
 			const cx = 300;
 			const cy = 300;
 			const rMax = 240;
+			const ctx = hslSourceCtx;
 
 			liqAnimActive = false;
-			drawBackgroundGuide(destCtx, W, H, cx, cy, rMax);
+			ctx.clearRect(0, 0, W, H);
 
 			if (type === 'spiral') {
 				const turns = 3.5;
 				const totalSteps = 4000;
-				destCtx.lineCap = 'round';
-				destCtx.lineJoin = 'round';
-				destCtx.lineWidth = 6;
+				ctx.lineCap = 'round';
+				ctx.lineJoin = 'round';
+				ctx.lineWidth = 6;
 
 				let prevX = cx;
 				let prevY = cy;
@@ -1397,33 +1454,33 @@
 					const sat = Math.min(1.0, r / rMax);
 					const rgb = hslToRgb(hue, sat, 0.5);
 
-					destCtx.beginPath();
-					destCtx.moveTo(prevX, prevY);
-					destCtx.lineTo(x, y);
-					destCtx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-					destCtx.stroke();
+					ctx.beginPath();
+					ctx.moveTo(prevX, prevY);
+					ctx.lineTo(x, y);
+					ctx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+					ctx.stroke();
 
 					prevX = x;
 					prevY = y;
 				}
 			} else if (type === 'spokes') {
 				const numSpokes = 12;
-				destCtx.lineWidth = 5;
-				destCtx.lineCap = 'round';
+				ctx.lineWidth = 5;
+				ctx.lineCap = 'round';
 				for (let k = 0; k < numSpokes; k++) {
 					const hue = k / numSpokes;
 					const theta = hue * 2 * Math.PI;
 					const rgb = hslToRgb(hue, 1.0, 0.5);
-					destCtx.beginPath();
-					destCtx.moveTo(cx, cy);
-					destCtx.lineTo(cx + rMax * Math.cos(theta), cy + rMax * Math.sin(theta));
-					destCtx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-					destCtx.stroke();
+					ctx.beginPath();
+					ctx.moveTo(cx, cy);
+					ctx.lineTo(cx + rMax * Math.cos(theta), cy + rMax * Math.sin(theta));
+					ctx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+					ctx.stroke();
 				}
 			} else if (type === 'rings') {
 				const rings = [0.25, 0.5, 0.75, 1.0];
 				const steps = 360;
-				destCtx.lineWidth = 6;
+				ctx.lineWidth = 6;
 				for (let ri = 0; ri < rings.length; ri++) {
 					const r = rMax * rings[ri];
 					for (let deg = 0; deg < steps; deg++) {
@@ -1431,16 +1488,16 @@
 						const rad2 = ((deg + 1.5) * Math.PI) / 180;
 						const hue = deg / 360;
 						const rgb = hslToRgb(hue, rings[ri], 0.5);
-						destCtx.beginPath();
-						destCtx.arc(cx, cy, r, rad1, rad2);
-						destCtx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-						destCtx.stroke();
+						ctx.beginPath();
+						ctx.arc(cx, cy, r, rad1, rad2);
+						ctx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+						ctx.stroke();
 					}
 				}
 			} else if (type === 'flower') {
 				const steps = 3000;
-				destCtx.lineWidth = 6;
-				destCtx.lineCap = 'round';
+				ctx.lineWidth = 6;
+				ctx.lineCap = 'round';
 				let prevX = 0, prevY = 0;
 				for (let i = 0; i <= steps; i++) {
 					const theta = (i / steps) * 2 * Math.PI;
@@ -1451,17 +1508,30 @@
 					const sat = Math.min(1.0, Math.max(0.0, r / rMax));
 					const rgb = hslToRgb(hue, sat, 0.5);
 					if (i > 0) {
-						destCtx.beginPath();
-						destCtx.moveTo(prevX, prevY);
-						destCtx.lineTo(x, y);
-						destCtx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
-						destCtx.stroke();
+						ctx.beginPath();
+						ctx.moveTo(prevX, prevY);
+						ctx.lineTo(x, y);
+						ctx.strokeStyle = `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+						ctx.stroke();
 					}
 					prevX = x;
 					prevY = y;
 				}
 			}
-			showToast('HSL Lineart preset loaded on diagram!');
+
+			publishHslSource();
+			// Mirror the direct presets, which render their diagram on click:
+			// a reverse example immediately produces its image.
+			convertReverseHslToImage();
+			showToast('HSL lineart loaded → reverse image generated!');
+		}
+
+		// Show the clean distribution on the diagram (guide underneath) and
+		// mark it as the authoritative source for the next reverse pass.
+		function publishHslSource() {
+			drawBackgroundGuide(destCtx, W, H, 300, 300, 240);
+			destCtx.drawImage(hslSourceCanvas, 0, 0);
+			hslSourceValid = true;
 		}
 
 		function loadHslHeightmapImage(file) {
@@ -1475,7 +1545,6 @@
 					const rMax = 240;
 
 					liqAnimActive = false;
-					drawBackgroundGuide(destCtx, W, H, cx, cy, rMax);
 
 					const tempCanvas = document.createElement('canvas');
 					tempCanvas.width = rMax * 2;
@@ -1485,8 +1554,10 @@
 					const imgData = tempCtx.getImageData(0, 0, rMax * 2, rMax * 2);
 					const data = imgData.data;
 
-					const destImgData = destCtx.getImageData(0, 0, W, H);
-					const destData = destImgData.data;
+					// Built on the transparent source canvas: every untouched
+					// pixel stays fully transparent so it reads as "no data".
+					const srcImgData = hslSourceCtx.createImageData(W, H);
+					const srcData = srcImgData.data;
 
 					for (let y = 0; y < rMax * 2; y++) {
 						for (let x = 0; x < rMax * 2; x++) {
@@ -1516,37 +1587,179 @@
 							const dstY = Math.round(cy + dy);
 							if (dstX >= 0 && dstX < W && dstY >= 0 && dstY < H) {
 								const dstIdx = (dstY * W + dstX) * 4;
-								destData[dstIdx] = rgb[0];
-								destData[dstIdx + 1] = rgb[1];
-								destData[dstIdx + 2] = rgb[2];
-								destData[dstIdx + 3] = 255;
+								srcData[dstIdx] = rgb[0];
+								srcData[dstIdx + 1] = rgb[1];
+								srcData[dstIdx + 2] = rgb[2];
+								srcData[dstIdx + 3] = 255;
 							}
 						}
 					}
-					destCtx.putImageData(destImgData, 0, 0);
-					showToast('HSL Greyscale Heightmap loaded!');
+					hslSourceCtx.clearRect(0, 0, W, H);
+					hslSourceCtx.putImageData(srcImgData, 0, 0);
+					publishHslSource();
+					convertReverseHslToImage();
+					hslFileInput.value = '';
+					showToast('HSL heightmap loaded → reverse image generated!');
 				};
 				img.src = e.target.result;
 			};
 			reader.readAsDataURL(file);
 		}
 
+		// --- ROUNDTRIP PALETTE SNAP ---
+		// 8-bit RGB cannot express every (hue, saturation) pair exactly, so
+		// the color emitted for diagram pixel (tx, ty) normally returns to a
+		// slightly different pixel when the direct pipeline maps it back:
+		// the distribution blurs a little on every cycle. Searching the +-2
+		// RGB neighborhood of the canonical color (ordered center-out, so
+		// the first exact hit is also the smallest visual nudge) finds the
+		// variant whose RGB -> HSL -> polar position lands back on (tx, ty).
+		// The nudge is at most 2/255 per channel - invisible - and it pulls
+		// the mean roundtrip displacement from ~0.5 px down to ~0.1 px.
+		const SNAP_SPAN = 2;
+		const SNAP_DIM = SNAP_SPAN * 2 + 1;
+		const SNAP_COUNT = SNAP_DIM * SNAP_DIM * SNAP_DIM;
+		const snapOffR = new Int8Array(SNAP_COUNT);
+		const snapOffG = new Int8Array(SNAP_COUNT);
+		const snapOffB = new Int8Array(SNAP_COUNT);
+
+		function initSnapOffsets() {
+			// Order by Chebyshev shell first, then by squared length, so the
+			// scan can stop at the first zero-error candidate.
+			const order = [];
+			for (let dr = -SNAP_SPAN; dr <= SNAP_SPAN; dr++) {
+				for (let dg = -SNAP_SPAN; dg <= SNAP_SPAN; dg++) {
+					for (let db = -SNAP_SPAN; db <= SNAP_SPAN; db++) {
+						order.push([dr, dg, db]);
+					}
+				}
+			}
+			order.sort((a, b) => {
+				const ca = Math.max(Math.abs(a[0]), Math.abs(a[1]), Math.abs(a[2]));
+				const cb = Math.max(Math.abs(b[0]), Math.abs(b[1]), Math.abs(b[2]));
+				if (ca !== cb) return ca - cb;
+				return (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) - (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+			});
+			for (let i = 0; i < SNAP_COUNT; i++) {
+				snapOffR[i] = order[i][0];
+				snapOffG[i] = order[i][1];
+				snapOffB[i] = order[i][2];
+			}
+		}
+
+		// Same RGB -> HSL math as the hot placement loop. Results land in
+		// module-level slots so no tuple is boxed per call.
+		let snapHue = 0;
+		let snapSat = 0;
+		function rgbToHueSat(r, g, b) {
+			const rf = r / 255;
+			const gf = g / 255;
+			const bf = b / 255;
+			const max = rf > gf ? (rf > bf ? rf : bf) : (gf > bf ? gf : bf);
+			const min = rf < gf ? (rf < bf ? rf : bf) : (gf < bf ? gf : bf);
+			let h = 0;
+			let s = 0;
+			const l = (max + min) * 0.5;
+			if (max !== min) {
+				const d = max - min;
+				s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+				if (max === rf) h = (gf - bf) / d + (gf < bf ? 6 : 0);
+				else if (max === gf) h = (bf - rf) / d + 2;
+				else h = (rf - gf) / d + 4;
+				h /= 6;
+			}
+			snapHue = h;
+			snapSat = s;
+		}
+
+		// Snapped color, written to module-level slots (no allocation).
+		let snapR = 0;
+		let snapG = 0;
+		let snapB = 0;
+		function snapColorToCell(r0, g0, b0, tx, ty, cx, cy, rMax) {
+			let bestR = r0;
+			let bestG = g0;
+			let bestB = b0;
+			let bestErr = Infinity;
+			for (let k = 0; k < SNAP_COUNT; k++) {
+				const r = r0 + snapOffR[k];
+				const g = g0 + snapOffG[k];
+				const b = b0 + snapOffB[k];
+				if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255) continue;
+				rgbToHueSat(r, g, b);
+				const theta = snapHue * 2 * Math.PI;
+				const dist = snapSat * rMax;
+				const dx = Math.round(cx + dist * Math.cos(theta)) - tx;
+				const dy = Math.round(cy + dist * Math.sin(theta)) - ty;
+				const e = dx * dx + dy * dy;
+				if (e < bestErr) {
+					bestErr = e;
+					bestR = r;
+					bestG = g;
+					bestB = b;
+					if (e === 0) break;
+				}
+			}
+			snapR = bestR;
+			snapG = bestG;
+			snapB = bestB;
+			return Math.sqrt(bestErr);
+		}
+
+		// sRGB -> CIE L*a*b* for a real (CIE76) color error, using a 256
+		// entry linearization table instead of a pow() per channel.
+		const SRGB_LINEAR = new Float64Array(256);
+		for (let i = 0; i < 256; i++) {
+			const v = i / 255;
+			SRGB_LINEAR[i] = v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+		}
+		let labL = 0;
+		let labA = 0;
+		let labB = 0;
+		function rgbToLab(r, g, b) {
+			const rl = SRGB_LINEAR[r];
+			const gl = SRGB_LINEAR[g];
+			const bl = SRGB_LINEAR[b];
+			// D65 white point, normalized so pure white maps to (100, 0, 0).
+			let x = (0.4124564 * rl + 0.3575761 * gl + 0.1804375 * bl) / 0.95047;
+			let y = (0.2126729 * rl + 0.7151522 * gl + 0.0721750 * bl);
+			let z = (0.0193339 * rl + 0.1191920 * gl + 0.9503041 * bl) / 1.08883;
+			x = x > 0.008856 ? Math.cbrt(x) : (7.787 * x + 16 / 116);
+			y = y > 0.008856 ? Math.cbrt(y) : (7.787 * y + 16 / 116);
+			z = z > 0.008856 ? Math.cbrt(z) : (7.787 * z + 16 / 116);
+			labL = 116 * y - 16;
+			labA = 500 * (x - y);
+			labB = 200 * (y - z);
+		}
+
+		// Fidelity of the last reverse pass, surfaced in the stats panel and
+		// reused by the roundtrip test so both report the same numbers.
+		let revPosErrMean = 0;
+		let revPosErrMax = 0;
+		let revWithin1Pct = 0;
+		let revDeltaE = 0;
+
+		// --- REVERSE: HSL DIAGRAM -> SYNTHESIZED IMAGE ---
+		// Reads the active distribution (the guide-free lineart/heightmap
+		// canvas when one is loaded, otherwise whatever the diagram shows),
+		// samples it proportionally to pixel brightness and lays the colors
+		// out as a hue-sorted serpentine mosaic. The mosaic is sized to the
+		// pixel budget so the direct pipeline can take it back 1:1 without
+		// resampling, and every emitted color is snapped so it returns to
+		// the diagram pixel it came from.
 		function convertReverseHslToImage() {
 			const startTime = performance.now();
 			const cx = 300;
 			const cy = 300;
 			const rMax = 240;
 
-			const srcImgData = destCtx.getImageData(0, 0, W, H);
-			const data = srcImgData.data;
-
-			const maxCells = W * H;
-			const cellHues = new Float32Array(maxCells);
-			const cellSats = new Float32Array(maxCells);
-			const cellLights = new Float32Array(maxCells);
-			const cellWeights = new Float32Array(maxCells);
-			const cellSortKeys = new Float32Array(maxCells);
-			const cellIndices = new Uint32Array(maxCells);
+			// A loaded lineart/heightmap is read from its clean copy; a
+			// diagram painted by the direct pipeline is read as-is, and
+			// then the faint guide overlay has to be filtered by luminance.
+			const useCleanSource = hslSourceValid;
+			const srcCtx = useCleanSource ? hslSourceCtx : destCtx;
+			const data = srcCtx.getImageData(0, 0, W, H).data;
+			const minLum = useCleanSource ? 8 : 24;
 
 			let cellCount = 0;
 			let totalWeight = 0;
@@ -1567,7 +1780,7 @@
 					const cb = data[idx + 2];
 
 					const lum = 0.299 * cr + 0.587 * cg + 0.114 * cb;
-					if (lum < 24) continue; // ignore dark background & faint guide lines
+					if (lum < minLum) continue; // dark background & faint guide lines
 
 					let theta = Math.atan2(dy, dx);
 					if (theta < 0) theta += 2 * Math.PI;
@@ -1582,19 +1795,28 @@
 					let l = (mx + mn) * 0.5;
 					if (l < 0.08) l = 0.5;
 
-					const weight = Math.max(1.0, lum);
+					// Antialiased stroke edges keep their pure palette color
+					// but only count for the fraction of the pixel they
+					// actually cover, so a soft edge does not inflate the
+					// population the way a fully lit pixel does.
+					const weight = a < 255 ? lum * a * (1 / 255) : lum;
 
 					const c = cellCount;
-					cellHues[c] = h;
-					cellSats[c] = s;
-					cellLights[c] = l;
-					cellWeights[c] = weight;
-					cellSortKeys[c] = h * 1000.0 + s;
-					cellIndices[c] = c;
+					revCellHue[c] = h;
+					revCellSat[c] = s;
+					revCellLight[c] = l;
+					revCellWeight[c] = weight > 1 ? weight : 1;
+					revCellSortKey[c] = h * 1000.0 + s;
+					revCellX[c] = x;
+					revCellY[c] = y;
+					revCellColor[c] = (cr << 16) | (cg << 8) | cb;
+					revCellOrder[c] = c;
 
-					totalWeight += weight;
+					totalWeight += revCellWeight[c];
 					cellCount++;
+					if (cellCount === REV_MAX_CELLS) break;
 				}
+				if (cellCount === REV_MAX_CELLS) break;
 			}
 
 			if (cellCount === 0) {
@@ -1602,10 +1824,14 @@
 				return;
 			}
 
-			cellIndices.subarray(0, cellCount).sort((a, b) => cellSortKeys[a] - cellSortKeys[b]);
+			revCellOrder.subarray(0, cellCount).sort((a, b) => revCellSortKey[a] - revCellSortKey[b]);
 
-			const targetW = 320;
-			const targetH = 240;
+			// Match the mosaic to the pixel budget: at that size the direct
+			// pipeline passes it through untouched, which is what keeps the
+			// distribution intact across a full HSL -> image -> HSL cycle.
+			const maxPixels = parseInt(maxPixelsSlider.value, 10);
+			const targetW = Math.max(1, Math.floor(Math.sqrt(maxPixels * 4 / 3)));
+			const targetH = Math.max(1, Math.floor(maxPixels / targetW));
 			const totalPixels = targetW * targetH;
 
 			previewCanvas.width = targetW;
@@ -1613,34 +1839,64 @@
 			const outImgData = previewCtx.createImageData(targetW, targetH);
 			const outData = outImgData.data;
 
-			const prefixWeights = new Float64Array(cellCount);
 			let runningSum = 0;
 			for (let i = 0; i < cellCount; i++) {
-				const origIdx = cellIndices[i];
-				runningSum += cellWeights[origIdx];
-				prefixWeights[i] = runningSum;
+				runningSum += revCellWeight[revCellOrder[i]];
+				revPrefixWeight[i] = runningSum;
 			}
 
+			// Per-cell snap results are computed once and reused for the
+			// whole run of output pixels that samples the same cell.
 			let cellPtr = 0;
+			let heldCell = -1;
+			let heldR = 0;
+			let heldG = 0;
+			let heldB = 0;
+			let errSum = 0;
+			let errMax = 0;
+			let within1 = 0;
+			let deSum = 0;
+			let snappedCells = 0;
+
 			for (let i = 0; i < totalPixels; i++) {
 				const targetWgt = ((i + 0.5) / totalPixels) * totalWeight;
-				while (cellPtr < cellCount - 1 && prefixWeights[cellPtr] < targetWgt) {
+				while (cellPtr < cellCount - 1 && revPrefixWeight[cellPtr] < targetWgt) {
 					cellPtr++;
 				}
-				const origIdx = cellIndices[cellPtr];
-				const h = cellHues[origIdx];
-				const s = cellSats[origIdx];
-				const l = cellLights[origIdx];
-				const rgb = hslToRgb(h, s, l);
+				const origIdx = revCellOrder[cellPtr];
+				if (origIdx !== heldCell) {
+					heldCell = origIdx;
+					const rgb = hslToRgb(revCellHue[origIdx], revCellSat[origIdx], revCellLight[origIdx]);
+					const err = snapColorToCell(rgb[0], rgb[1], rgb[2], revCellX[origIdx], revCellY[origIdx], cx, cy, rMax);
+					heldR = snapR;
+					heldG = snapG;
+					heldB = snapB;
 
-				const y = Math.floor(i / targetW);
-				let x = i % targetW;
-				if (y % 2 === 1) x = targetW - 1 - x;
+					const src = revCellColor[origIdx];
+					rgbToLab((src >> 16) & 0xFF, (src >> 8) & 0xFF, src & 0xFF);
+					const l0 = labL;
+					const a0 = labA;
+					const b0 = labB;
+					rgbToLab(heldR, heldG, heldB);
+					const dl = labL - l0;
+					const da = labA - a0;
+					const db = labB - b0;
+					deSum += Math.sqrt(dl * dl + da * da + db * db);
+					snappedCells++;
+
+					errSum += err;
+					if (err > errMax) errMax = err;
+					if (err <= 1) within1++;
+				}
+
+				const y = (i / targetW) | 0;
+				let x = i - y * targetW;
+				if ((y & 1) === 1) x = targetW - 1 - x;
 
 				const outIdx = (y * targetW + x) * 4;
-				outData[outIdx] = rgb[0];
-				outData[outIdx + 1] = rgb[1];
-				outData[outIdx + 2] = rgb[2];
+				outData[outIdx] = heldR;
+				outData[outIdx + 1] = heldG;
+				outData[outIdx + 2] = heldB;
 				outData[outIdx + 3] = 255;
 			}
 
@@ -1649,17 +1905,26 @@
 			previewCanvas.style.display = 'block';
 
 			currentImage = previewCanvas;
+			currentImageExact = true; // palette colors: never resample or blend
 			originalWidth = targetW;
 			originalHeight = targetH;
 			statsOrigRes.textContent = `${targetW} × ${targetH}`;
+
+			revPosErrMean = errSum / snappedCells;
+			revPosErrMax = errMax;
+			revWithin1Pct = within1 * 100 / snappedCells;
+			revDeltaE = deSum / snappedCells;
+			statsRoundtripDeltaE.textContent = revDeltaE.toFixed(2);
+			statsRoundtripPos.textContent = `${revPosErrMean.toFixed(2)} px · ${revWithin1Pct.toFixed(1)}% ≤1px`;
 
 			const elapsed = performance.now() - startTime;
 			showToast(`Reverse HSL → Image produced (${elapsed.toFixed(1)} ms)!`);
 		}
 
-		function computeHslHistogramFromCanvas(canvas) {
-			const hist = new Float32Array(HIST_TOTAL_BINS);
-			const ctx = canvas.getContext('2d');
+		// Weighted hue/saturation histogram of a 600x600 diagram context.
+		// `hist` is supplied by the caller so repeated tests allocate nothing.
+		function computeHslHistogram(ctx, minLum, hist) {
+			hist.fill(0);
 			const imgData = ctx.getImageData(0, 0, W, H);
 			const data = imgData.data;
 			const cx = 300;
@@ -1680,7 +1945,7 @@
 
 					const cr = data[idx], cg = data[idx + 1], cb = data[idx + 2];
 					const lum = 0.299 * cr + 0.587 * cg + 0.114 * cb;
-					if (lum < 24) continue;
+					if (lum < minLum) continue;
 
 					let theta = Math.atan2(dy, dx);
 					if (theta < 0) theta += 2 * Math.PI;
@@ -1718,15 +1983,22 @@
 			return hist;
 		}
 
+		// Full HSL -> image -> HSL cycle. The "before" histogram is taken
+		// from whatever the reverse pass will actually read (the guide-free
+		// lineart when one is loaded), so the measurement is not polluted by
+		// the coordinate overlay that only exists for the human eye.
+		const histBefore = new Float32Array(HIST_TOTAL_BINS);
+		const histAfter = new Float32Array(HIST_TOTAL_BINS);
+
 		function runRoundtripTest() {
 			const startTime = performance.now();
 
-			const histBefore = computeHslHistogramFromCanvas(destCanvas);
+			const cleanSource = hslSourceValid;
+			computeHslHistogram(cleanSource ? hslSourceCtx : destCtx, cleanSource ? 8 : 24, histBefore);
 
 			convertReverseHslToImage();
-			render();
-
-			const histAfter = computeHslHistogramFromCanvas(destCanvas);
+			render(); // direct pipeline paints the mosaic back onto the diagram
+			computeHslHistogram(destCtx, 24, histAfter);
 
 			let tvLoss = 0;
 			for (let i = 0; i < HIST_TOTAL_BINS; i++) {
@@ -1734,16 +2006,16 @@
 			}
 			const lossPercent = 0.5 * tvLoss * 100.0;
 			const fidelity = Math.max(0, 100.0 - lossPercent);
-			const deltaE = (lossPercent / 100.0) * 0.25;
 
 			const totalElapsed = performance.now() - startTime;
 
 			statsRoundtripLoss.textContent = `${lossPercent.toFixed(2)}%`;
 			statsRoundtripFidelity.textContent = `${fidelity.toFixed(2)}%`;
-			statsRoundtripDeltaE.textContent = deltaE.toFixed(3);
+			statsRoundtripDeltaE.textContent = revDeltaE.toFixed(2);
+			statsRoundtripPos.textContent = `${revPosErrMean.toFixed(2)} px · ${revWithin1Pct.toFixed(1)}% ≤1px`;
 			statsRoundtripTime.textContent = `${totalElapsed.toFixed(1)} ms`;
 
-			showToast(`Roundtrip complete! Loss: ${lossPercent.toFixed(2)}%, Fidelity: ${fidelity.toFixed(2)}%`);
+			showToast(`Roundtrip: ${lossPercent.toFixed(2)}% loss · ${revPosErrMean.toFixed(2)} px mean displacement (max ${revPosErrMax.toFixed(2)} px)`);
 		}
 
 		let mcRunning = false;
@@ -2051,22 +2323,36 @@
 
 			iso3dUpdateInteractive(); // camera affordances follow the active mode
 
+			// The diagram is about to be repainted with a placement, so the
+			// loaded lineart/heightmap is no longer what it shows.
+			hslSourceValid = false;
+
 			const startTime = performance.now();
 			const maxPixels = parseInt(maxPixelsSlider.value, 10);
 			const vizStyle = engineSelector.value;
 
-			// Calculate resampled width and height preserving aspect ratio
+			// Calculate resampled width and height preserving aspect ratio.
+			// Exact-palette sources (the reverse mosaic) are passed through
+			// 1:1 when they fit the budget and scaled without smoothing
+			// otherwise: blending two palette colors produces a color that
+			// belongs somewhere else entirely on the diagram.
 			const ar = originalWidth / originalHeight;
-			let srcW = Math.sqrt(maxPixels * ar);
-			let srcH = Math.sqrt(maxPixels / ar);
-			srcW = Math.max(1, Math.round(srcW));
-			srcH = Math.max(1, Math.round(srcH));
+			let srcW;
+			let srcH;
+			if (currentImageExact && originalWidth * originalHeight <= maxPixels) {
+				srcW = originalWidth;
+				srcH = originalHeight;
+			} else {
+				srcW = Math.max(1, Math.round(Math.sqrt(maxPixels * ar)));
+				srcH = Math.max(1, Math.round(Math.sqrt(maxPixels / ar)));
+			}
 
 			statsResampledRes.textContent = `${srcW} × ${srcH}`;
 
 			// Downscale image to offscreen canvas
 			offscreenCanvas.width = srcW;
 			offscreenCanvas.height = srcH;
+			offscreenCtx.imageSmoothingEnabled = !currentImageExact;
 			offscreenCtx.drawImage(currentImage, 0, 0, srcW, srcH);
 
 			const srcImgData = offscreenCtx.getImageData(0, 0, srcW, srcH);
