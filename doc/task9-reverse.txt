@@ -1,0 +1,6 @@
+make function and button that work in reverse way: load canvas a greyscale (heightmap) source to circular hue HSL diagram and from it produce image with such color distribution.
+
+add buttons:
+- example linear HSL distribution (load good simple lineart on HSL canvas)
+- load HSL image (any load as greyscale heightmap
+	
