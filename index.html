@@ -346,6 +346,27 @@
 			border-radius: 6px;
 		}
 
+		.reverse-tools {
+			margin-top: 16px;
+			padding-top: 16px;
+			border-top: 1px solid var(--border-color);
+			display: flex;
+			flex-direction: column;
+			gap: 8px;
+		}
+
+		.reverse-tools-title {
+			font-size: 12px;
+			font-weight: 600;
+			color: var(--text-main);
+		}
+
+		.reverse-help {
+			font-size: 11px;
+			line-height: 1.45;
+			color: var(--text-muted);
+		}
+
 		/* Stats list */
 		.stats-list {
 			display: flex;
@@ -489,6 +510,9 @@
 		<div class="sidebar">
 			<!-- Image Source Panel -->
 			<div class="panel">
+				<div class="panel-title">
+					<span id="source-panel-title">Image source</span>
+				</div>
 				<div class="control-group">
 					<div class="preview-box" id="image-preview-container">
 						<div class="preview-placeholder" id="preview-placeholder">No image loaded</div>
@@ -506,6 +530,13 @@
 					<button class="btn preset-btn" data-preset="blocks">Color Blocks</button>
 					<button class="btn preset-btn" data-preset="sunset">Vibrant Sunset</button>
 					<button class="btn preset-btn" data-preset="noise">Random Noise</button>
+				</div>
+				<div class="reverse-tools">
+					<div class="reverse-tools-title">Reverse: distribution → image</div>
+					<button class="btn" id="btn-reverse-example">Example Linear HSL Distribution</button>
+					<button class="btn" id="btn-reverse-load">Load HSL Heightmap</button>
+					<input type="file" id="reverse-file-input" accept="image/*" style="display: none;">
+					<div class="reverse-help">Any image is read as grayscale: angle selects hue, radius selects saturation, and brightness controls how many pixels are generated. Black is zero height; generated colors use 50% lightness.</div>
 				</div>
 			</div>
 
@@ -530,7 +561,7 @@
 				</div>
 				<div class="control-group">
 					<div class="control-label">
-						<span>Max Resampled Pixels</span>
+						<span id="max-pixels-label">Max Resampled Pixels</span>
 						<span class="control-value" id="max-pixels-val">50,000</span>
 					</div>
 					<div class="slider-container">
@@ -577,7 +608,7 @@
 						<span class="stats-val" id="stats-resampled-res">-</span>
 					</div>
 					<div class="stats-item">
-						<span class="stats-label">Pixels Placed</span>
+						<span class="stats-label" id="stats-pixels-label">Pixels Placed</span>
 						<span class="stats-val" id="stats-pixels-placed">-</span>
 					</div>
 					<div class="stats-item">
@@ -602,7 +633,7 @@
 		</div>
 	</main>
 
-	<footer>1 - Select Image File; 2 - choose Visualization Style</footer>
+	<footer>Forward: select an image and visualization style · Reverse: load an HSL heightmap to synthesize its color distribution</footer>
 
 	<div id="toast">Image loaded successfully!</div>
 
@@ -610,6 +641,17 @@
 		// --- CONFIG & CONSTANTS ---
 		const W = 600;
 		const H = 600;
+
+		// Reverse mode reads a square grayscale heightmap as an H/S polar
+		// distribution. Its 481px disc maps exactly to the 240px 2D island:
+		// angle is hue, radius is saturation, and luminance is population.
+		const REVERSE_MAP_SIZE = 481;
+		const REVERSE_MAP_RADIUS = 240;
+		const REVERSE_MAP_CELLS = REVERSE_MAP_SIZE * REVERSE_MAP_SIZE;
+		const reverseWeight = new Uint8Array(REVERSE_MAP_CELLS);
+		const reverseColor = new Uint32Array(REVERSE_MAP_CELLS);
+		let reverseTotalWeight = 0;
+		let reverseMapHash = 0;
 
 		// Pre-allocated arrays for spiral offsets
 		const MAX_SPIRAL_OFFSETS = 150000;
@@ -779,9 +821,13 @@
 		const cameraHint = document.getElementById('camera-hint');
 		const fileInput = document.getElementById('file-input');
 		const btnSelect = document.getElementById('btn-select');
+		const reverseFileInput = document.getElementById('reverse-file-input');
+		const btnReverseExample = document.getElementById('btn-reverse-example');
+		const btnReverseLoad = document.getElementById('btn-reverse-load');
 		
 		const engineSelector = document.getElementById('engine-selector');
 		const maxPixelsSlider = document.getElementById('max-pixels-slider');
+		const maxPixelsLabel = document.getElementById('max-pixels-label');
 		const maxPixelsVal = document.getElementById('max-pixels-val');
 
 		const heightScaleGroup = document.getElementById('height-scale-group');
@@ -794,12 +840,14 @@
 		
 		const statsOrigRes = document.getElementById('stats-orig-res');
 		const statsResampledRes = document.getElementById('stats-resampled-res');
+		const statsPixelsLabel = document.getElementById('stats-pixels-label');
 		const statsPixelsPlaced = document.getElementById('stats-pixels-placed');
 		const statsTime = document.getElementById('stats-time');
 		
 		const previewCanvas = document.getElementById('preview-canvas');
 		const previewCtx = previewCanvas.getContext('2d');
 		const previewPlaceholder = document.getElementById('preview-placeholder');
+		const sourcePanelTitle = document.getElementById('source-panel-title');
 		const toast = document.getElementById('toast');
 
 		const btnBenchmark = document.getElementById('btn-benchmark');
@@ -812,10 +860,27 @@
 		let currentImage = null; // Can be Image or Canvas (preset)
 		let originalWidth = 0;
 		let originalHeight = 0;
+		let reverseHeightmapActive = false;
 
 		// --- OFFSCREEN CANVASES (REUSED TO AVOID ALLOCATIONS) ---
 		const offscreenCanvas = document.createElement('canvas');
 		const offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
+
+		const reverseSourceCanvas = document.createElement('canvas');
+		reverseSourceCanvas.width = REVERSE_MAP_SIZE;
+		reverseSourceCanvas.height = REVERSE_MAP_SIZE;
+		const reverseSourceCtx = reverseSourceCanvas.getContext('2d', { willReadFrequently: true });
+
+		const reverseGrayCanvas = document.createElement('canvas');
+		reverseGrayCanvas.width = REVERSE_MAP_SIZE;
+		reverseGrayCanvas.height = REVERSE_MAP_SIZE;
+		const reverseGrayCtx = reverseGrayCanvas.getContext('2d');
+		const reverseGrayImage = reverseGrayCtx.createImageData(REVERSE_MAP_SIZE, REVERSE_MAP_SIZE);
+
+		const reverseExampleCanvas = document.createElement('canvas');
+		reverseExampleCanvas.width = REVERSE_MAP_SIZE;
+		reverseExampleCanvas.height = REVERSE_MAP_SIZE;
+		const reverseExampleCtx = reverseExampleCanvas.getContext('2d');
 
 		const offscreenPlacementCanvas = document.createElement('canvas');
 		offscreenPlacementCanvas.width = W;
@@ -827,6 +892,7 @@
 		// --- INITIALIZATION ---
 		function init() {
 			initSpiral();
+			initReverseColors();
 			initLiquidIsland();
 			iso3dSupported(); // probe once so the camera affordances know their fate
 			prHideIfUnsupported();
@@ -860,6 +926,45 @@
 				}
 				x += dx;
 				y += dy;
+			}
+		}
+
+		// Precompute the canonical HSL color under every reverse-map sample.
+		// Lightness is fixed at 50% because the map's one data channel is used
+		// as population height; a 2D H/S diagram has no spare lightness axis.
+		function initReverseColors() {
+			const c = REVERSE_MAP_RADIUS;
+			for (let y = 0; y < REVERSE_MAP_SIZE; y++) {
+				const dy = y - c;
+				const row = y * REVERSE_MAP_SIZE;
+				for (let x = 0; x < REVERSE_MAP_SIZE; x++) {
+					const dx = x - c;
+					const dist = Math.sqrt(dx * dx + dy * dy);
+					if (dist > c) continue;
+
+					let hue = Math.atan2(dy, dx) / (Math.PI * 2);
+					if (hue < 0) hue += 1;
+					const sat = dist / c;
+					const h6 = hue * 6;
+					const sector = h6 | 0;
+					const chroma = sat;
+					const second = chroma * (1 - Math.abs((h6 % 2) - 1));
+					const match = (1 - chroma) * 0.5;
+					let r1 = 0;
+					let g1 = 0;
+					let b1 = 0;
+					if (sector === 0) { r1 = chroma; g1 = second; }
+					else if (sector === 1) { r1 = second; g1 = chroma; }
+					else if (sector === 2) { g1 = chroma; b1 = second; }
+					else if (sector === 3) { g1 = second; b1 = chroma; }
+					else if (sector === 4) { r1 = second; b1 = chroma; }
+					else { r1 = chroma; b1 = second; }
+
+					const r = Math.round((r1 + match) * 255);
+					const g = Math.round((g1 + match) * 255);
+					const b = Math.round((b1 + match) * 255);
+					reverseColor[row + x] = 0xFF000000 | (b << 16) | (g << 8) | r;
+				}
 			}
 		}
 
@@ -913,6 +1018,13 @@
 			// Select File Button
 			btnSelect.addEventListener('click', () => fileInput.click());
 			fileInput.addEventListener('change', handleFileSelect);
+
+			// Reverse distribution controls. Both paths prepare the same
+			// grayscale height field, then the max-pixel slider regenerates its
+			// deterministic color mosaic live.
+			btnReverseExample.addEventListener('click', loadLinearHslExample);
+			btnReverseLoad.addEventListener('click', () => reverseFileInput.click());
+			reverseFileInput.addEventListener('change', handleReverseFileSelect);
 
 			// Drag and Drop
 			window.addEventListener('dragover', (e) => {
@@ -1014,7 +1126,21 @@
 		}
 
 		// --- PRESETS GENERATOR ---
+		function leaveReverseMode() {
+			if (!reverseHeightmapActive) return;
+			reverseHeightmapActive = false;
+			sourcePanelTitle.textContent = 'Image source';
+			maxPixelsLabel.textContent = 'Max Resampled Pixels';
+			statsPixelsLabel.textContent = 'Pixels Placed';
+			btnBenchmark.disabled = false;
+			const is3D = iso3dModeActive(engineSelector.value);
+			heightScaleGroup.style.display = is3D ? 'block' : 'none';
+			heightLogGroup.style.display = is3D ? 'block' : 'none';
+			iso3dUpdateInteractive();
+		}
+
 		function loadPreset(type) {
+			leaveReverseMode();
 			previewPlaceholder.style.display = 'none';
 			previewCanvas.style.display = 'block';
 			
@@ -1154,6 +1280,7 @@
 			reader.onload = (e) => {
 				const img = new Image();
 				img.onload = () => {
+					leaveReverseMode();
 					currentImage = img;
 					originalWidth = img.width;
 					originalHeight = img.height;
@@ -1183,7 +1310,201 @@
 			reader.readAsDataURL(file);
 		}
 
-		function showToast() {
+		// --- REVERSE: HSL HEIGHTMAP -> SYNTHESIZED IMAGE ---
+		function handleReverseFileSelect(e) {
+			if (e.target.files && e.target.files[0]) {
+				loadReverseHeightmapFile(e.target.files[0]);
+			}
+		}
+
+		function loadReverseHeightmapFile(file) {
+			if (!file.type.startsWith('image/')) return;
+			const reader = new FileReader();
+			reader.onload = (e) => {
+				const img = new Image();
+				img.onload = () => {
+					activateReverseHeightmap(img, img.width, img.height, 'HSL heightmap loaded');
+					reverseFileInput.value = '';
+				};
+				img.src = e.target.result;
+			};
+			reader.readAsDataURL(file);
+		}
+
+		// A one-turn Archimedean spiral is the clearest linear HSL example:
+		// hue and saturation both increase linearly along the stroke. Its gray
+		// value also rises toward the rim, demonstrating the population axis.
+		function loadLinearHslExample() {
+			const ctx = reverseExampleCtx;
+			const c = REVERSE_MAP_RADIUS;
+			ctx.clearRect(0, 0, REVERSE_MAP_SIZE, REVERSE_MAP_SIZE);
+			ctx.fillStyle = '#000000';
+			ctx.fillRect(0, 0, REVERSE_MAP_SIZE, REVERSE_MAP_SIZE);
+			ctx.lineCap = 'round';
+			ctx.lineJoin = 'round';
+
+			// Soft under-stroke keeps the line readable while remaining a valid
+			// grayscale heightmap rather than adding color decoration.
+			ctx.beginPath();
+			for (let i = 0; i <= 360; i++) {
+				const t = i / 360;
+				const theta = t * Math.PI * 2;
+				const radius = 4 + t * (c - 16);
+				const x = c + Math.cos(theta) * radius;
+				const y = c + Math.sin(theta) * radius;
+				if (i === 0) ctx.moveTo(x, y);
+				else ctx.lineTo(x, y);
+			}
+			ctx.strokeStyle = '#303030';
+			ctx.lineWidth = 16;
+			ctx.stroke();
+
+			let lastX = c + 4;
+			let lastY = c;
+			ctx.lineWidth = 8;
+			for (let i = 1; i <= 360; i++) {
+				const t = i / 360;
+				const theta = t * Math.PI * 2;
+				const radius = 4 + t * (c - 16);
+				const x = c + Math.cos(theta) * radius;
+				const y = c + Math.sin(theta) * radius;
+				const level = Math.round(72 + t * 183);
+				ctx.beginPath();
+				ctx.moveTo(lastX, lastY);
+				ctx.lineTo(x, y);
+				ctx.strokeStyle = `rgb(${level}, ${level}, ${level})`;
+				ctx.stroke();
+				lastX = x;
+				lastY = y;
+			}
+
+			activateReverseHeightmap(reverseExampleCanvas, REVERSE_MAP_SIZE, REVERSE_MAP_SIZE, 'Linear HSL distribution generated');
+		}
+
+		function activateReverseHeightmap(source, sourceWidth, sourceHeight, message) {
+			const size = REVERSE_MAP_SIZE;
+			reverseSourceCtx.clearRect(0, 0, size, size);
+			reverseSourceCtx.drawImage(source, 0, 0, size, size);
+			const sourceData = reverseSourceCtx.getImageData(0, 0, size, size).data;
+			const grayData = reverseGrayImage.data;
+			let total = 0;
+			let hash = 2166136261;
+
+			for (let i = 0, p = 0; i < REVERSE_MAP_CELLS; i++, p += 4) {
+				let height = 0;
+				if (reverseColor[i] !== 0) {
+					const luminance = (54 * sourceData[p] + 183 * sourceData[p + 1] + 19 * sourceData[p + 2] + 128) >> 8;
+					height = ((luminance * sourceData[p + 3] + 127) / 255) | 0;
+				}
+				reverseWeight[i] = height;
+				total += height;
+				hash = Math.imul(hash ^ height, 16777619);
+				grayData[p] = height;
+				grayData[p + 1] = height;
+				grayData[p + 2] = height;
+				grayData[p + 3] = 255;
+			}
+			reverseGrayCtx.putImageData(reverseGrayImage, 0, 0);
+			reverseTotalWeight = total;
+			reverseMapHash = hash >>> 0;
+			reverseHeightmapActive = true;
+
+			previewPlaceholder.style.display = 'none';
+			previewCanvas.style.display = 'block';
+			sourcePanelTitle.textContent = 'Generated color mosaic';
+			maxPixelsLabel.textContent = 'Max Generated Pixels';
+			statsPixelsLabel.textContent = 'Pixels Generated';
+			statsOrigRes.textContent = `${sourceWidth} × ${sourceHeight}`;
+			heightScaleGroup.style.display = 'none';
+			heightLogGroup.style.display = 'none';
+			benchmarkBox.style.display = 'none';
+			btnBenchmark.disabled = true;
+			liqAnimActive = false;
+			prPhase = 0;
+			prAnimActive = false;
+			iso3dUpdateInteractive();
+			scheduleRender();
+			showToast(message);
+		}
+
+		function reverseShuffle(pixels, count) {
+			// Seeded xorshift makes repeated renders stable while breaking the
+			// polar scan order, so the result is an unbiased color mosaic rather
+			// than a misleading spatial reconstruction.
+			let state = (reverseMapHash ^ count ^ 0x9E3779B9) >>> 0;
+			if (state === 0) state = 0x6D2B79F5;
+			for (let i = count - 1; i > 0; i--) {
+				state ^= state << 13;
+				state ^= state >>> 17;
+				state ^= state << 5;
+				const j = (state >>> 0) % (i + 1);
+				const temp = pixels[i];
+				pixels[i] = pixels[j];
+				pixels[j] = temp;
+			}
+		}
+
+		function drawReverseHeightmap() {
+			destCtx.fillStyle = '#0c0c0f';
+			destCtx.fillRect(0, 0, W, H);
+			destCtx.save();
+			destCtx.beginPath();
+			destCtx.arc(300, 300, 240, 0, Math.PI * 2);
+			destCtx.clip();
+			destCtx.imageSmoothingEnabled = true;
+			destCtx.drawImage(reverseGrayCanvas, 60, 60, 480, 480);
+			destCtx.restore();
+			// Draw the coordinate guide last, over the opaque heightmap.
+			drawBackgroundGuide(destCtx, W, H, 300, 300, 240, false);
+			destCtx.fillStyle = 'rgba(255, 255, 255, 0.6)';
+			destCtx.font = '11px monospace';
+			destCtx.textAlign = 'center';
+			destCtx.textBaseline = 'middle';
+			destCtx.fillText('GRAYSCALE HEIGHTMAP · WHITE = MORE PIXELS', 300, 24);
+		}
+
+		function renderReverseHeightmap() {
+			const startTime = performance.now();
+			const maxPixels = parseInt(maxPixelsSlider.value, 10);
+			const outW = Math.max(1, Math.floor(Math.sqrt(maxPixels * 4 / 3)));
+			const outH = Math.max(1, Math.floor(maxPixels / outW));
+			const outputCount = outW * outH;
+
+			previewCanvas.width = outW;
+			previewCanvas.height = outH;
+			const outputImage = previewCtx.createImageData(outW, outH);
+			const outputPixels = new Uint32Array(outputImage.data.buffer);
+			let generated = 0;
+
+			if (reverseTotalWeight > 0) {
+				const weightPerPixel = reverseTotalWeight / outputCount;
+				let threshold = weightPerPixel * 0.5;
+				let cumulative = 0;
+				for (let i = 0; i < REVERSE_MAP_CELLS && generated < outputCount; i++) {
+					cumulative += reverseWeight[i];
+					while (generated < outputCount && cumulative >= threshold) {
+						outputPixels[generated++] = reverseColor[i];
+						threshold += weightPerPixel;
+					}
+				}
+				// Floating point roundoff can only leave the final sample empty.
+				if (generated < outputCount) {
+					let last = REVERSE_MAP_CELLS - 1;
+					while (last > 0 && reverseWeight[last] === 0) last--;
+					while (generated < outputCount) outputPixels[generated++] = reverseColor[last];
+				}
+				reverseShuffle(outputPixels, generated);
+			}
+
+			previewCtx.putImageData(outputImage, 0, 0);
+			drawReverseHeightmap();
+			statsResampledRes.textContent = `${REVERSE_MAP_SIZE} × ${REVERSE_MAP_SIZE} map`;
+			statsPixelsPlaced.textContent = generated.toLocaleString();
+			statsTime.textContent = (performance.now() - startTime).toFixed(1) + ' ms';
+		}
+
+		function showToast(message = 'Image loaded successfully!') {
+			toast.textContent = message;
 			toast.classList.add('show');
 			setTimeout(() => {
 				toast.classList.remove('show');
@@ -1191,9 +1512,11 @@
 		}
 
 		// --- BACKGROUND GUIDE ---
-		function drawBackgroundGuide(ctx, w, h, cx, cy, rMax) {
-			ctx.fillStyle = '#0c0c0f';
-			ctx.fillRect(0, 0, w, h);
+		function drawBackgroundGuide(ctx, w, h, cx, cy, rMax, clear = true) {
+			if (clear) {
+				ctx.fillStyle = '#0c0c0f';
+				ctx.fillRect(0, 0, w, h);
+			}
 			
 			// Faint grid concentric circles (representing Saturation levels)
 			ctx.lineWidth = 1;
@@ -1399,6 +1722,11 @@
 
 		// --- MAIN HIGH-PERFORMANCE PLACEMENT ENGINE ---
 		function render() {
+			if (reverseHeightmapActive) {
+				iso3dUpdateInteractive();
+				renderReverseHeightmap();
+				return;
+			}
 			if (!currentImage) return;
 
 			iso3dUpdateInteractive(); // camera affordances follow the active mode
@@ -2286,7 +2614,7 @@
 		}
 
 		function liqAnimationTick() {
-			if (engineSelector.value !== liqMode) {
+			if (reverseHeightmapActive || engineSelector.value !== liqMode) {
 				liqAnimActive = false;
 				return;
 			}
@@ -2389,6 +2717,7 @@ void main() {
 		let iso3dInstGlBuf = null;
 
 		function iso3dModeActive(style) {
+			if (reverseHeightmapActive) return false;
 			return style === 'isometry' || style === 'lighttowers' || style === 'sand' || style === 'liquid';
 		}
 
@@ -3330,7 +3659,7 @@ void main() {
 		// the run it was scheduled for, so a re-render that happens while a
 		// tick is pending simply gets picked up by that pending tick.
 		function prTick() {
-			if (engineSelector.value !== 'pressure' || prPhase === 0 || prPhase === 4) {
+			if (reverseHeightmapActive || engineSelector.value !== 'pressure' || prPhase === 0 || prPhase === 4) {
 				prAnimActive = false;
 				return;
 			}

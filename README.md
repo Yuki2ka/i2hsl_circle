@@ -16,6 +16,10 @@ if too many same pixels - automatically scale down to fit same pixels on reasona
 to optimize implement high-performance Opaque Buffer approach. Instead of calculating distances for every pixel (O(N²)), it uses a pre-allocated integer grid to find the nearest empty slot in O(1) average time, ensuring no overlaps while representing color density. 
 benchmark button to compare speed of both versions
 
+### reverse distribution
+
+The reverse controls synthesize an image from a grayscale HSL heightmap. The map is interpreted as a polar hue/saturation diagram: angle selects hue, radius selects saturation, and grayscale brightness is the relative pixel population (black means zero). Generated colors use 50% lightness and are arranged as a deterministic shuffled mosaic because a color distribution contains no spatial information. The included linear example draws a grayscale Archimedean spiral where hue and saturation increase together.
+
 ### view modes
 
 3D isometry mode. in this mode placement is simple: same pixels increment bar height. properly calculate position of base pixel in pseudo-3d space.
