@@ -18,6 +18,8 @@ benchmark button to compare speed of both versions
 
 ### view modes
 
+![screenshot](2.avif)
+
 3D isometry mode. in this mode placement is simple: same pixels increment bar height. properly calculate position of base pixel in pseudo-3d space.
 visually it looks similar as pillars or distant skyscrapers on circular island, view from some angle above ground. 
 
