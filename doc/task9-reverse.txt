@@ -3,4 +3,15 @@ make function and button that work in reverse way: load canvas a greyscale (heig
 add buttons:
 - example linear HSL distribution (load good simple lineart on HSL canvas)
 - load HSL image (any load as greyscale heightmap
-	
+
+
+add direct/Reverse convert buttons
+
+add function to achieve more or less working roundtrip (for example spiral remains after hsl-img-hsl convertations)
+
+test is roundtrip works and loss %
+
+it should work as convert current image back and forth but not clean on toggle.
+use save diagrams view, stable gui. i press buttons and see input and hsl canvases updates.
+
+once done try some relaxation or fast monte-carlo or what to improve roundtrip (separate function as it may be slow)
