@@ -41,10 +41,28 @@ all four 3D modes render through a WebGL2 instanced-box renderer with a real dep
 
 why WebGL2: a freely rotating camera breaks the fixed back-to-front painter order, so correct occlusion needs a per-pixel depth test over up to 120k boxes — millions of depth-tested pixel writes per frame, far beyond interactive plain JS on the typed-array grid. consecutive equal-colour height units are merged into single tall boxes, which keeps every scene at or below one instanced draw call of 120k instances even at extreme height scales. when WebGL2 is unavailable (or the context is lost mid-session) the 3D modes automatically fall back to the original fixed-view Canvas2D painter — identical towers, no camera controls — exactly like before.
 
+### reverse conversion & roundtrip engine
+
+the visualizer supports two-way bidirectional mapping between images and circular HSL diagrams:
+
+1. **Reverse Conversion (HSL Diagram → Image)**:
+   - Reads the active HSL diagram or circular grayscale heightmap.
+   - Interprets polar coordinates $(u, v)$ as hue $h$ and saturation $s$, and cell mass/luminance as lightness/density.
+   - Synthesizes a new continuous image in the input preview with that exact color distribution.
+2. **Direct Conversion (Image → HSL Diagram)**:
+   - Maps pixels of the input image back onto the circular HSL diagram using any active 2D or 3D engine.
+3. **HSL Lineart & Greyscale Heightmap Sources**:
+   - Built-in presets for clean geometric HSL linearts: Archimedean Spiral, 12-arm Radial Spokes, Concentric Saturation Rings, and Flower Rose curves.
+   - "Load HSL Image (Heightmap)" imports any image directly onto the circular HSL disc as a grayscale heightmap.
+4. **Roundtrip Loss & Fidelity Verification**:
+   - Tests HSL ⇄ Image roundtrips and computes Total Variation Loss %, Color Fidelity %, and Color Error $\Delta E$.
+   - Geometric structures (e.g. spiral curves) are preserved across roundtrip cycles.
+5. **Monte-Carlo Spatial Lloyd Relaxation**:
+   - Optimizes reconstructed image spatial coherence (smoothing gradients and eliminating noise) while conserving 100% of the HSL color distribution.
+
 ### web site
 
 https://github.com/Yuki2ka/i2hsl_circle/index.html
 
 git
 https://github.com/Yuki2ka/i2hsl_circle.git
-
